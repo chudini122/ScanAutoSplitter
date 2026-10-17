@@ -62,13 +62,17 @@ biblioteki instalują się wtedy tylko dla tego projektu i nie mieszają się z 
 
 ### Wariant 1 (zalecany): środowisko wirtualne `venv`
 
+> **Ważne:** zawsze instaluj przez `python -m pip …`, a nie samo `pip …`. Gdy na komputerze
+> jest kilka Pythonów, `python` i `pip` mogą wskazywać na **różne** instalacje — biblioteki
+> trafią wtedy do innego Pythona niż ten, który uruchamia skrypt (patrz sekcja 6).
+
 **Windows (PowerShell):**
 
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
-pip install -r requirements.txt
+python -m pip install -r requirements.txt
 ```
 
 > Jeśli PowerShell zgłosi błąd „running scripts is disabled on this system”, wykonaj raz:
@@ -83,7 +87,7 @@ pip install -r requirements.txt
 python -m venv .venv
 .venv\Scripts\activate.bat
 python -m pip install --upgrade pip
-pip install -r requirements.txt
+python -m pip install -r requirements.txt
 ```
 
 **Linux / macOS:**
@@ -92,7 +96,7 @@ pip install -r requirements.txt
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
-pip install -r requirements.txt
+python -m pip install -r requirements.txt
 ```
 
 > Debian/Ubuntu: jeśli `venv` nie działa, doinstaluj go: `sudo apt install python3-venv`.
@@ -126,7 +130,7 @@ python3 -m pip install --user -r requirements.txt      # Linux / macOS
 ```bash
 conda create -n scansplit python=3.12 -y
 conda activate scansplit
-pip install -r requirements.txt
+python -m pip install -r requirements.txt
 ```
 
 ### Sprawdzenie instalacji
@@ -209,11 +213,52 @@ i między odbitką a krawędzią szyby — detekcja jest wtedy najdokładniejsza
 
 | Komunikat | Rozwiązanie |
 |---|---|
-| `ModuleNotFoundError: No module named 'cv2'` | biblioteki nie są zainstalowane albo nie aktywowano `.venv` — patrz sekcja 3 |
+| `ModuleNotFoundError: No module named 'cv2'` / `Brak biblioteki: cv2` | biblioteki nie są zainstalowane, nie aktywowano `.venv` albo zainstalowano je do innego Pythona — patrz niżej „Kilka Pythonów na Windows” |
+| `python -m venv .venv` → `Permission denied: 'C:\Program Files\LibreOffice\…'` | polecenie `python` uruchamia Pythona wbudowanego w LibreOffice — patrz niżej |
 | `'python' is not recognized…` (Windows) | zainstaluj Pythona z opcją „Add to PATH” lub użyj `py` zamiast `python` |
 | `externally-managed-environment` (Linux) | użyj środowiska wirtualnego (wariant 1) |
 | `nie można odczytać pliku` | plik jest uszkodzony lub to nie jest obraz |
 | Brak wyników dla skanu (`zdjęć: 0`) | uruchom z `--debug` i dostrój parametry (sekcja 5) |
+
+---
+
+### Kilka Pythonów na Windows (np. LibreOffice, Inkscape, GIMP, QGIS)
+
+Niektóre programy instalują własnego Pythona i dopisują go do `PATH`. Wtedy polecenie
+`python` może uruchamiać np. Pythona z LibreOffice (nie da się w nim utworzyć `venv`
+ani zainstalować bibliotek), a `pip` — zupełnie innego Pythona.
+
+1. Sprawdź, które Pythony są widoczne (pierwszy na liście wygrywa):
+   ```bat
+   where python
+   where pip
+   py -0p
+   ```
+2. Utwórz środowisko **wskazując właściwego Pythona wprost** — wybierz działający wariant:
+   ```bat
+   py -3.13 -m venv .venv
+   ```
+   ```bat
+   python3.13 -m venv .venv
+   ```
+   ```bat
+   "%LOCALAPPDATA%\Microsoft\WindowsApps\python3.13.exe" -m venv .venv
+   ```
+   (ostatni wariant dotyczy Pythona z Microsoft Store; dla instalacji z python.org ścieżka to
+   zwykle `"%LOCALAPPDATA%\Programs\Python\Python313\python.exe"`).
+3. Aktywuj środowisko i zainstaluj biblioteki — po aktywacji `python` wskazuje już na `.venv`:
+   ```bat
+   .venv\Scripts\activate.bat
+   python -m pip install -r requirements.txt
+   python scan_autosplitter.py "D:\skany" "D:\skany\wyniki"
+   ```
+
+Bez środowiska wirtualnego wystarczy konsekwentnie używać tego samego interpretera do
+instalacji i uruchamiania, np. `python3.13 -m pip install -r requirements.txt`, a potem
+`python3.13 scan_autosplitter.py …`.
+
+Na stałe można też usunąć katalog LibreOffice z `PATH` (Ustawienia → System → Informacje →
+Zaawansowane ustawienia systemu → Zmienne środowiskowe) lub przesunąć właściwego Pythona wyżej.
 
 ---
 

@@ -31,8 +31,17 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 
-import cv2
-import numpy as np
+try:
+    import cv2
+    import numpy as np
+except ImportError as _exc:  # najczęstszy problem przy pierwszym uruchomieniu
+    sys.exit(
+        f"Brak biblioteki: {_exc.name}\n"
+        f"Skrypt uruchomiono interpreterem: {sys.executable}\n"
+        f"Zainstaluj biblioteki DLA TEGO interpretera:\n"
+        f'    "{sys.executable}" -m pip install -r requirements.txt\n'
+        f"(Jeśli to nie jest Python, którego chcesz używać — zobacz README, sekcja 6.)"
+    )
 
 # =============================================================================
 # KONFIGURACJA — główne parametry do strojenia
