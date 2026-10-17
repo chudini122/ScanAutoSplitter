@@ -175,7 +175,7 @@ python scan_autosplitter.py "C:\Users\Jan\Skany\album" "C:\Users\Jan\Skany\wynik
 | `--format png` / `--format tiff` | format wyjściowy (domyślnie `png`; `tiff` = bez kompresji) |
 | `--workers N` | liczba równoległych procesów (domyślnie: liczba rdzeni − 1) |
 | `--recursive` | przetwarzaj także podfoldery |
-| `--debug` | zapisz podgląd detekcji `<skan>_debug.jpg` (ramki na skanie + maska) |
+| `--debug` | zapisz podglądy: `<skan>_debug.jpg` (ramki, numery i obroty na skanie + maska) oraz `<skan>_debug_twarze.jpg` (wycinki po obrocie z zaznaczonymi twarzami i pewnością dla każdej orientacji) |
 | `--no-face-rotate` | wyłącz automatyczne obracanie zdjęć wg twarzy |
 | `-v`, `--verbose` | szczegółowe logi |
 
@@ -190,7 +190,24 @@ python scan_autosplitter.py skany wyniki --format tiff --workers 4 --debug
   (rzędami od góry, w rzędzie od lewej).
 - Skan, na którym nic nie wykryto, jest zgłaszany ostrzeżeniem; uszkodzony plik — błędem,
   ale nie przerywa przetwarzania pozostałych.
-- Na końcu wyświetla się podsumowanie, np. `Gotowe: 37 zdjęć z 12 skanów w 18.4s (błędy: 0)`.
+- Na końcu wyświetla się podsumowanie, np. `Gotowe: 37 zdjęć z 12 skanów w 18.4s (obrócone: 9, błędy: 0)`.
+
+### Podgląd `--debug`
+
+- `<skan>_debug.jpg` — po lewej skan z czerwonymi ramkami i numerami wycinków (np.
+  `2: obrot 90 w prawo`), po prawej maska „zdjęcie / tło”. Jeśli dwa zdjęcia mają jedną
+  wspólną ramkę, nie zostały rozdzielone.
+- `<skan>_debug_twarze.jpg` — każdy zapisany wycinek (już po obrocie), zielone ramki to
+  wykryte twarze z pewnością (0–1). Pod spodem decyzja i najwyższa pewność twarzy w każdej
+  z 4 orientacji: `0` (bez obrotu), `L90` (90° w lewo), `180`, `P90` (90° w prawo).
+  Zdjęcie jest obracane, gdy najlepsza orientacja ma twarz o pewności ≥ 0.8
+  i wyraźnie (o 0.1) wyższej niż bez obrotu.
+
+### Duże skany (1200 dpi) i pamięć RAM
+
+Skan A4 w 1200 dpi to ok. 400 MB w pamięci; jeden proces zużywa ok. 1.6 GB RAM
+i przetwarza skan w ok. 30 s. Przy `--workers 4` potrzeba więc ok. 6–7 GB wolnej pamięci —
+jeśli komputer ma mniej RAM, użyj `--workers 2`.
 
 ---
 
@@ -210,13 +227,15 @@ Wszystkie parametry są stałymi na początku pliku `scan_autosplitter.py` (sekc
 | Białe trójkąty / paski w rogach wycinków | zwiększ `CROP_INSET_PX` (np. 4–6) |
 | Ucina białą ramkę odbitek | zmniejsz `GROW_DELTA` (np. 2.0) |
 | Do zdjęcia doklejony pas tła | zwiększ `GROW_DELTA` (np. 5.0) lub ustaw `GROW_TO_PAPER_EDGE = False` |
-| Dwa blisko leżące zdjęcia wycięte jako jedno | zmniejsz `CLOSE_KERNEL_FRAC` (np. 0.002) |
+| Dwa blisko leżące zdjęcia wycięte jako jedno | zmniejsz `GAP_MIN_FRAC` (np. 0.45) lub `CLOSE_KERNEL_FRAC` (np. 0.002) |
+| Jedno zdjęcie rozcięte na części (np. wzdłuż jasnego słupa, horyzontu) | zwiększ `GAP_MIN_FRAC` (np. 0.7) lub zmniejsz `GAP_MAX_CONTINUITY` (np. 0.3); `GAP_SPLIT = False` wyłącza cięcie wzdłuż przerw |
 | Zdjęcie bez twarzy obrócone niepotrzebnie | zwiększ `FACE_MIN_CONFIDENCE` (np. 0.9) lub użyj `--no-face-rotate` |
 | Zdjęcie z twarzami nie zostało obrócone | zmniejsz `FACE_MIN_CONFIDENCE` (np. 0.7) |
 
-**Wskazówka przy skanowaniu:** zostawiaj choćby 2–3 mm odstępu między odbitkami — detekcja
-jest wtedy najdokładniejsza. Zdjęcia nachodzące na siebie (bez widocznej przerwy) mogą zostać
-wycięte jako jedno.
+**Wskazówka przy skanowaniu:** zdjęcia rozdzielane są nawet przy szczelinie ok. 0.3 mm, także
+gdy szczelina jest krzywa i w jednym rogu zdjęcia się stykają. Zdjęcia stykające się na całej
+długości boku (bez żadnej widocznej szczeliny) albo nachodzące na siebie mogą zostać wycięte
+jako jedno — zostaw między nimi choćby minimalny odstęp.
 
 **Orientacja:** obracane są tylko zdjęcia, na których wykryto twarz. Zdjęcia bez ludzi
 (krajobrazy, budynki) zostają w orientacji, w jakiej leżały na skanerze.
@@ -283,6 +302,10 @@ Zaawansowane ustawienia systemu → Zmienne środowiskowe) lub przesunąć wła�
    mapa odległości od tła (Lab) + krawędzie Canny, usunięcie ramki/cienia skanera, operacje
    morfologiczne, rozdzielanie sklejonych zdjęć (transformata odległości + watershed),
    filtracja konturów (pole, wymiary, prostokątność).
+   Cięcie wzdłuż wąskich szczelin: w każdym obszarze szukane są proste linie (±3°), które
+   prawie na całej długości są tłem skanera, a tuż obok — zdjęciem. Cięcie jest przyjmowane,
+   gdy obie części wyglądają jak odbitki (proporcje, rozmiar), a treść nie „przechodzi”
+   przez linię (niska korelacja obu stron — chroni np. białe słupy budynków).
 3. Doprecyzowanie każdej ramki na pełnej rozdzielczości i dołączenie białej ramki odbitki
    (uśrednione profile linii wzdłuż każdego boku).
 4. Prostowanie (transformacja perspektywiczna, interpolacja Lanczos). Zdjęcia leżące prosto

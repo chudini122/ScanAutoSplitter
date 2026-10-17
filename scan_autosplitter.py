@@ -10,8 +10,9 @@ Pipeline (klasyczne CV, OpenCV + NumPy):
          - usunięcie ramki/cienia skanera (linie przy brzegu pokryte prawie na całej długości),
          - małe domknięcie, wypełnienie dziur, otwarcie (usuwa kurz, włosy, cienkie mostki),
          - rozdzielanie sklejonych zdjęć (transformata odległości + watershed),
+         - cięcie wzdłuż wąskich, prostych szczelin (profile linii pod kątami ±3°),
          - filtracja konturów: pole, wymiary, prostokątność.
-    3. Doprecyzowanie każdego prostokąta na pełnej rozdzielczości (minAreaRect otoczki wypukłej)
+    3. Doprecyzowanie każdego prostokąta w wyższej rozdzielczości (minAreaRect otoczki wypukłej)
        i rozszerzenie o jasny margines odbitki (biała ramka) na podstawie profili linii.
     4. Deskew: transformacja perspektywiczna prostokąta obróconego -> prostokąt osiowy
        (Lanczos), opcjonalne przycięcie resztek tła na brzegach. Kąt ~0° = czyste wycięcie,
@@ -62,7 +63,7 @@ DEFAULT_WORKERS = max(1, (os.cpu_count() or 2) - 1)
 # --- Detekcja (na pomniejszonej kopii roboczej) ------------------------------
 # Rozmiary jąder morfologicznych są ułamkiem DŁUŻSZEGO BOKU SKANU, więc nie zależą od DPI.
 # Dla A4 (297 mm): 0.001 ≈ 0.3 mm.
-WORK_MAX_SIDE = 1600             # dłuższy bok kopii roboczej [px]; większy = dokładniej, wolniej
+WORK_MAX_SIDE = 2000             # dłuższy bok kopii roboczej [px]; większy = dokładniej, wolniej
 BG_MAX_CHROMA = 12.0             # max. "kolorowość" piksela tła (tło skanera jest neutralne: biel/szarość)
 BG_DIFF_THRESHOLD = 14.0         # min. odległość koloru od tła (ΔE w Lab, skala 0-255) = "zdjęcie"
 BG_DIFF_BLUR = 5                 # rozmycie mapy różnic (tłumi szum/ziarno skanera), nieparzyste
@@ -86,8 +87,32 @@ SPLIT_CORE_LEVELS = (0.5, 0.6, 0.7, 0.8)  # progi transformaty odległości (uł
 SPLIT_MIN_PART_FRAC = 0.12       # część po rozdzieleniu musi mieć >= tyle pola całego obszaru
 SPLIT_WORK_SIDE = 400            # rozdzielanie liczone na obszarze pomniejszonym do tylu px (szybkość)
 
+# --- Cięcie wzdłuż wąskich przerw (zdjęcia ułożone równo, prawie stykające się) ---
+GAP_SPLIT = True                 # szukaj prostych, wąskich linii tła przecinających obszar
+GAP_BG_DIFF = 22.0               # piksel przerwy: ΔE od tła skanera <= tyle
+GAP_COUNT_PAPER_WHITE = True     # licz też jasny neutralny piksel (biały brzeg odbitki) jako przerwę
+GAP_MIN_FRAC = 0.55              # linia cięcia: >= tyle jej długości to przerwa (reszta: zdjęcia się stykają)
+GAP_SIDE_MAX_FRAC = 0.3          # linie kontrolne po obu stronach cięcia mogą mieć najwyżej tyle "przerwy"
+                                 # — odróżnia wąską szczelinę od jasnego fragmentu zdjęcia
+GAP_STRONG_FRAC = 0.9            # wyjątek: linia przerwy prawie na całej długości (>= tyle) może mieć
+GAP_CONTRAST = 0.12              # jasną treść (np. prześwietlone niebo) po jednej stronie, o ile ta
+                                 # strona ma o tyle mniej "przerwy" niż samo cięcie
+GAP_BAND_FRAC = 0.0012           # połowa szerokości pasa wokół linii (ułamek boku skanu; ~0.35 mm na A4)
+GAP_SIDE_OFFSET_FRAC = 0.008     # odległość linii kontrolnych od cięcia (~2.4 mm na A4)
+GAP_MAX_ANGLE = 3.0              # max. odchylenie linii cięcia od boku obszaru [°] (krzywo leżące zdjęcia)
+GAP_ANGLE_STEP = 0.25            # krok przeszukiwania kąta [°]
+GAP_MIN_PART_FRAC = 0.15         # każda część po cięciu musi mieć >= tyle szerokości całego obszaru
+GAP_MAX_CONTINUITY = 0.45        # max. korelacja treści po obu stronach cięcia; przy prawdziwej szczelinie
+                                 # sąsiadują dwa różne zdjęcia (korelacja ~0), a jasny element zdjęcia
+                                 # (np. biały filar budynku) ma po obu stronach tę samą strukturę
+GAP_PART_MAX_ASPECT = 3.2        # części po cięciu muszą wyglądać jak odbitki: proporcje boków <= tyle
+GAP_PART_MIN_SIDE_FRAC = 0.08    # ...i krótszy bok >= tyle dłuższego boku skanu (~24 mm na A4)
+GAP_MAX_DEPTH = 6                # max. głębokość rekurencji (2^6 = 64 zdjęcia w jednym obszarze)
+
 # --- Doprecyzowanie i prostowanie --------------------------------------------
-REFINE_FULL_RES = True           # doprecyzuj krawędzie na pełnej rozdzielczości
+REFINE_FULL_RES = True           # doprecyzuj krawędzie w wyższej rozdzielczości
+REFINE_MAX_SIDE = 6000           # doprecyzowanie na kopii o dłuższym boku <= tyle px (~500 dpi dla A4);
+                                 # skany 1200 dpi nie potrzebują większej precyzji, a zużywają dużo RAM
 REFINE_MARGIN_FRAC = 0.03        # margines ROI przy doprecyzowaniu (ułamek boku zdjęcia)
 REFINE_OPEN_FRAC = 0.02          # otwarcie przy doprecyzowaniu (ułamek boku zdjęcia) — odcina kurz
                                  # przyklejony do krawędzi, który zawyżałby otoczkę wypukłą
@@ -109,9 +134,10 @@ INTERPOLATION = cv2.INTER_LANCZOS4
 # --- Automatyczna orientacja wg twarzy (lokalnie, model YuNet ~230 KB) --------
 AUTO_ROTATE_FACES = True         # obracaj zdjęcia o 90/180/270°, aby twarze były pionowo
 FACE_MODEL_PATH = Path(__file__).resolve().parent / "models" / "face_detection_yunet_2023mar.onnx"
-FACE_DETECT_SIDES = (640, 1024)  # rozmiary (dłuższy bok), na których szukamy twarzy — kolejno; większy
+FACE_DETECT_SIDES = (640, 1024, 1600)  # rozmiary (dłuższy bok) do szukania twarzy — kolejno; większy
                                  # tylko gdy na mniejszym brak pewnej twarzy (małe twarze, zdjęcia grupowe)
 FACE_SCORE_THRESHOLD = 0.6       # min. pewność pojedynczej twarzy branej pod uwagę
+FACE_ENHANCE = True              # wyrównanie kontrastu (CLAHE) przed detekcją — ciemne, stare odbitki
 FACE_MIN_CONFIDENCE = 0.8        # obracamy tylko, gdy w nowej orientacji jest twarz o takiej pewności
 FACE_ROTATION_MARGIN = 0.1       # ...i jest ona pewniejsza niż najlepsza twarz w obecnej orientacji o tyle
 
@@ -290,7 +316,14 @@ def build_foreground_mask(bgr8: np.ndarray):
     mask = morph(mask, cv2.MORPH_CLOSE, long_side * CLOSE_KERNEL_FRAC)
     mask = fill_holes(mask)
     mask = morph(mask, cv2.MORPH_OPEN, long_side * OPEN_KERNEL_FRAC)
-    return mask, bg_lab, edges
+
+    # Mapa "przerwy": tło skanera albo jasny, neutralny papier (krawędź odbitki, prześwit szczeliny).
+    lab = cv2.cvtColor(bgr8, cv2.COLOR_BGR2LAB)
+    chroma = np.hypot(lab[..., 1].astype(np.float32) - 128, lab[..., 2].astype(np.float32) - 128)
+    gap = diff <= GAP_BG_DIFF
+    if GAP_COUNT_PAPER_WHITE:
+        gap |= (lab[..., 0] >= bg_lab[0] - 3) & (chroma <= BG_MAX_CHROMA)
+    return mask, bg_lab, edges, gap.astype(np.uint8)
 
 
 # -----------------------------------------------------------------------------
@@ -373,7 +406,135 @@ def split_touching(contour: np.ndarray, img_area: float, img_long: float) -> lis
     return []
 
 
-def find_candidates(mask: np.ndarray) -> list:
+def upright_frame(rect):
+    """Macierz afiniczna: układ obrazu -> układ prostokąta (oś x wzdłuż górnego boku) i jego wymiary."""
+    src = order_corners(cv2.boxPoints(rect))
+    w, h = np.linalg.norm(src[1] - src[0]), np.linalg.norm(src[3] - src[0])
+    ux, uy = (src[1] - src[0]) / max(w, 1e-6), (src[3] - src[0]) / max(h, 1e-6)
+    A = np.array([[ux[0], ux[1], -src[0] @ ux], [uy[0], uy[1], -src[0] @ uy]], np.float32)
+    return A, int(np.ceil(w)) + 1, int(np.ceil(h)) + 1
+
+
+def gap_cut_candidates(gap_u: np.ndarray, mask_u: np.ndarray, long_side: float) -> list:
+    """
+    Szuka w obszarze (w układzie wyprostowanym) prostych linii przerwy.
+
+    Dla kątów ±GAP_MAX_ANGLE obracamy mapę przerw i liczymy, jaka część każdego wiersza
+    (cięcie poziome) i kolumny (cięcie pionowe) jest przerwą. Szczelina między zdjęciami daje
+    wysoki, wąski pik; jasny fragment zdjęcia — szeroki "płaskowyż" (odrzucany liniami kontrolnymi).
+    Zwraca kandydatów (wynik, macierz obrotu, oś 0/1, pozycja) od najlepszego.
+    """
+    h, w = mask_u.shape
+    b = max(1, int(round(GAP_BAND_FRAC * long_side)))
+    off = max(b + 2, int(round(GAP_SIDE_OFFSET_FRAC * long_side)))
+    found = []
+    for theta in np.arange(-GAP_MAX_ANGLE, GAP_MAX_ANGLE + 1e-6, GAP_ANGLE_STEP):
+        R = cv2.getRotationMatrix2D((w / 2, h / 2), float(theta), 1.0)
+        g = cv2.warpAffine(gap_u, R, (w, h), flags=cv2.INTER_NEAREST)
+        m = cv2.warpAffine(mask_u, R, (w, h), flags=cv2.INTER_NEAREST)
+        for axis in (0, 1):  # 0: linie poziome (profil wierszy), 1: pionowe (profil kolumn)
+            k = (1, 2 * b + 1) if axis else (2 * b + 1, 1)
+            gd = cv2.dilate(g, np.ones(k, np.uint8)) & m
+            den = m.sum(axis=1 - axis).astype(np.float32)
+            num = gd.sum(axis=1 - axis).astype(np.float32)
+            ok = den >= 0.5 * den.max()
+            idx = np.flatnonzero(ok)
+            if len(idx) < 3 * off:
+                continue
+            lo, hi = idx[0], idx[-1]
+            frac = np.where(ok, num / np.maximum(den, 1), np.nan)
+            min_part = max(GAP_MIN_PART_FRAC * (hi - lo), off)
+            pos = np.arange(int(lo + min_part), int(hi - min_part) + 1)
+            if len(pos) == 0:
+                continue
+            centre = np.nan_to_num(frac[pos], nan=0.0)
+            left = np.nan_to_num(frac[pos - off], nan=1.0)
+            right = np.nan_to_num(frac[pos + off], nan=1.0)
+            lo_side, hi_side = np.minimum(left, right), np.maximum(left, right)
+            good = (centre >= GAP_MIN_FRAC) & (lo_side <= GAP_SIDE_MAX_FRAC) & (
+                (hi_side <= GAP_SIDE_MAX_FRAC) | ((centre >= GAP_STRONG_FRAC) & (hi_side <= centre - GAP_CONTRAST)))
+            score = np.where(good, centre - hi_side, -1.0)
+            # Lokalne maksima (po jednym na "pik"), najlepsze 3 dla danego kąta i osi.
+            for i in np.argsort(score)[::-1][:3]:
+                if score[i] <= 0:
+                    break
+                found.append((float(score[i]), R, axis, int(pos[i]), off))
+    found.sort(key=lambda c: -c[0])
+    return found
+
+
+def content_continuity(gray_u: np.ndarray, mask_u: np.ndarray, R: np.ndarray, axis: int,
+                       pos: int, off: int) -> float:
+    """
+    Korelacja treści po obu stronach linii cięcia (pasy szerokości ~off tuż za liniami
+    kontrolnymi). Prawdziwa szczelina rozdziela dwa niezwiązane zdjęcia -> korelacja bliska 0.
+    """
+    h, w = mask_u.shape
+    g = cv2.warpAffine(gray_u, R, (w, h), flags=cv2.INTER_LINEAR)
+    m = cv2.warpAffine(mask_u, R, (w, h), flags=cv2.INTER_NEAREST)
+    if axis:
+        g, m = g.T, m.T
+    n = g.shape[0]
+    a0, a1 = max(0, pos - 2 * off), max(0, pos - off)
+    b0, b1 = min(n, pos + off + 1), min(n, pos + 2 * off + 1)
+    if a1 - a0 < 2 or b1 - b0 < 2:
+        return 0.0
+    valid = (m[a0:a1].min(axis=0) > 0) & (m[b0:b1].min(axis=0) > 0)
+    if valid.sum() < 20:
+        return 0.0
+    sa, sb = g[a0:a1].mean(axis=0)[valid], g[b0:b1].mean(axis=0)[valid]
+    k = max(3, len(sa) // 10) | 1  # usunięcie wolnej zmienności (gradient oświetlenia, winieta)
+    sa = sa - cv2.blur(sa.reshape(-1, 1), (1, k)).ravel()
+    sb = sb - cv2.blur(sb.reshape(-1, 1), (1, k)).ravel()
+    if sa.std() < 1.0 or sb.std() < 1.0:
+        return 0.0  # po jednej stronie brak struktury (np. jednolite niebo) — nie ma czego ciągnąć
+    return float(np.corrcoef(sa, sb)[0, 1])
+
+
+def gap_cut_regions(region: np.ndarray, gap: np.ndarray, gray: np.ndarray, img_area: float,
+                    img_long: float, depth: int = 0) -> list:
+    """Rekurencyjnie tnie obszar (maskę w układzie roboczym) wzdłuż przerw. Zwraca prostokąty."""
+    pts = cv2.findNonZero(region)
+    if pts is None:
+        return []
+    rect = cv2.minAreaRect(cv2.convexHull(pts))
+    if depth >= GAP_MAX_DEPTH or rect[1][0] * rect[1][1] < 2 * MIN_AREA_FRAC * img_area:
+        return [rect]
+    A, w, h = upright_frame(rect)
+    gap_u = cv2.warpAffine(gap, A, (w, h), flags=cv2.INTER_NEAREST)
+    mask_u = cv2.warpAffine(region, A, (w, h), flags=cv2.INTER_NEAREST) // 255
+    gray_u = cv2.warpAffine(gray, A, (w, h), flags=cv2.INTER_LINEAR).astype(np.float32)
+    cut = None
+    for _, R, axis, pos, off in gap_cut_candidates(gap_u, mask_u, img_long)[:8]:
+        corr = content_continuity(gray_u, mask_u, R, axis, pos, off)
+        if corr <= GAP_MAX_CONTINUITY:
+            cut = (R, axis, pos)
+            break
+        log.debug("Odrzucono linię cięcia: treść ciągnie się przez nią (korelacja %.2f)", corr)
+    if cut is None:
+        return [rect]
+    R, axis, pos = cut
+    # Strona linii dla każdego piksela obszaru: obraz -> układ wyprostowany -> obrócony o theta.
+    p = pts.reshape(-1, 2).astype(np.float32)
+    q = p @ A[:, :2].T + A[:, 2]
+    t = q @ R[1 - axis, :2] + R[1 - axis, 2]  # oś 0 = wiersze -> współrzędna y po obrocie
+    parts = []
+    for sel in (t < pos, t >= pos):
+        sub = np.zeros_like(region)
+        sp = p[sel].astype(np.int32)
+        sub[sp[:, 1], sp[:, 0]] = 255
+        sub = morph(sub, cv2.MORPH_OPEN, 3)  # odcina resztki szczeliny przy linii cięcia
+        r = fit_rect(cv2.findNonZero(sub)) if cv2.countNonZero(sub) else None
+        if r is None or not rect_ok(r, img_area, img_long) or \
+                min(r[1]) < GAP_PART_MIN_SIDE_FRAC * img_long or \
+                max(r[1]) / max(min(r[1]), 1e-6) > GAP_PART_MAX_ASPECT:
+            return [rect]  # cięcie dałoby kawałek niepodobny do odbitki — rezygnujemy
+        parts.append(sub)
+    log.debug("Cięcie wzdłuż przerwy (głębokość %d, oś %d)", depth, axis)
+    return [r for sub in parts for r in gap_cut_regions(sub, gap, gray, img_area, img_long, depth + 1)]
+
+
+def find_candidates(mask: np.ndarray, gap: np.ndarray | None = None, gray: np.ndarray | None = None) -> list:
     """Zwraca listę obróconych prostokątów (w układzie kopii roboczej)."""
     h, w = mask.shape
     img_area, img_long = float(h * w), float(max(h, w))
@@ -388,11 +549,16 @@ def find_candidates(mask: np.ndarray) -> list:
         parts = split_touching(c, img_area, img_long)
         if parts:
             log.debug("Rozdzielono zlepiony obszar na %d zdjęć", len(parts))
-            rects.extend(r for _, r in parts)
-        elif rect_ok(r, img_area, img_long):
-            if rectangularity(c, r) < MIN_RECTANGULARITY:
-                log.debug("Kształt nieprostokątny (%.2f) — używam minAreaRect otoczki", rectangularity(c, r))
-            rects.append(r)
+        elif rect_ok(r, img_area, img_long) or (GAP_SPLIT and gap is not None):
+            parts = [(c, r)]
+        for pc, pr in parts:
+            if GAP_SPLIT and gap is not None:
+                region = np.zeros_like(mask)
+                cv2.drawContours(region, [pc], -1, 255, cv2.FILLED)
+                rects.extend(x for x in gap_cut_regions(region, gap, gray, img_area, img_long)
+                             if rect_ok(x, img_area, img_long))
+            elif rect_ok(pr, img_area, img_long):
+                rects.append(pr)
     return rects
 
 
@@ -558,20 +724,24 @@ def extract_deskewed(img: np.ndarray, rect) -> np.ndarray:
 
 def auto_trim(crop: np.ndarray, bg_lab: np.ndarray) -> np.ndarray:
     """Obcina z każdej strony wiersze/kolumny, które w większości wyglądają jak tło skanera."""
-    if crop.shape[0] < 8 or crop.shape[1] < 8:
+    h, w = crop.shape[:2]
+    if h < 8 or w < 8:
         return crop
-    is_bg = background_distance(to_bgr8(crop), bg_lab)[0] <= AUTO_TRIM_BG_DIFF
-    h, w = is_bg.shape
-    max_y, max_x = int(h * AUTO_TRIM_MAX_FRAC), int(w * AUTO_TRIM_MAX_FRAC)
-    top = bottom = left = right = 0
-    while top < max_y and is_bg[top].mean() >= AUTO_TRIM_BG_RATIO:
-        top += 1
-    while bottom < max_y and is_bg[h - 1 - bottom].mean() >= AUTO_TRIM_BG_RATIO:
-        bottom += 1
-    while left < max_x and is_bg[:, left].mean() >= AUTO_TRIM_BG_RATIO:
-        left += 1
-    while right < max_x and is_bg[:, w - 1 - right].mean() >= AUTO_TRIM_BG_RATIO:
-        right += 1
+    my, mx = max(1, int(h * AUTO_TRIM_MAX_FRAC)), max(1, int(w * AUTO_TRIM_MAX_FRAC))
+
+    def bg_lines(strip: np.ndarray, axis: int) -> np.ndarray:
+        # Analizujemy tylko wąskie pasy brzegowe — nie całą (np. 1200 dpi) odbitkę.
+        is_bg = background_distance(to_bgr8(strip), bg_lab)[0] <= AUTO_TRIM_BG_DIFF
+        return is_bg.mean(axis=axis) >= AUTO_TRIM_BG_RATIO
+
+    def depth(flags: np.ndarray) -> int:
+        nz = np.flatnonzero(~flags)
+        return int(nz[0]) if len(nz) else len(flags)
+
+    top = depth(bg_lines(crop[:my], 1))
+    bottom = depth(bg_lines(crop[h - my:], 1)[::-1])
+    left = depth(bg_lines(crop[:, :mx], 0))
+    right = depth(bg_lines(crop[:, w - mx:], 0)[::-1])
     return crop[top:h - bottom, left:w - right]
 
 
@@ -615,11 +785,15 @@ def get_face_detector():
     return _face_detector or None
 
 
-def face_score(det, img8: np.ndarray) -> tuple[float, float]:
-    """(suma pewności, najwyższa pewność) twarzy ustawionych pionowo w danym obrazie."""
+ROTATION_NAMES = {0: "bez obrotu", 1: "90 w lewo", 2: "180", 3: "90 w prawo"}  # k jak w np.rot90
+
+
+def face_score(det, img8: np.ndarray):
+    """(suma pewności, najwyższa pewność, twarze [x,y,w,h,pewność]) dla twarzy stojących pionowo."""
     det.setInputSize((img8.shape[1], img8.shape[0]))
     _, faces = det.detect(img8)
     total = best = 0.0
+    found = []
     for f in faces if faces is not None else []:
         # YuNet: [x,y,w,h, oko P, oko L, nos, usta P, usta L (x,y), pewność]
         eyes_y, nose_y, mouth_y = (f[5] + f[7]) / 2, f[9], (f[11] + f[13]) / 2
@@ -627,67 +801,147 @@ def face_score(det, img8: np.ndarray) -> tuple[float, float]:
             continue  # układ punktów nie pasuje do pionowej twarzy
         total += float(f[14])
         best = max(best, float(f[14]))
-    return total, best
+        found.append([float(v) for v in f[:4]] + [float(f[14])])
+    return total, best, found
 
 
-def face_orientation(crop: np.ndarray) -> int:
-    """Liczba obrotów o 90° (przeciwnie do wskazówek zegara, jak np.rot90), po których twarze
-    stoją pionowo. 0 = bez zmian (także gdy na zdjęciu nie ma pewnie wykrytych twarzy)."""
+def enhance_for_faces(img8: np.ndarray) -> np.ndarray:
+    """Wyrównanie kontrastu jasności (CLAHE) — pomaga na ciemnych, wyblakłych odbitkach."""
+    lab = cv2.cvtColor(img8, cv2.COLOR_BGR2LAB)
+    lab[..., 0] = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(lab[..., 0])
+    return cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+
+
+def face_orientation(crop: np.ndarray) -> tuple[int, dict]:
+    """
+    Liczba obrotów o 90° (przeciwnie do wskazówek zegara, jak np.rot90), po których twarze
+    stoją pionowo; 0 = bez zmian (także gdy na zdjęciu nie ma pewnie wykrytych twarzy).
+    Drugi element to opis decyzji (do podglądu --debug).
+    """
+    info = {"scores": [0.0] * 4, "side": None, "faces": [], "reason": "brak twarzy"}
     det = get_face_detector()
     if det is None:
-        return 0
+        info["reason"] = "detektor niedostepny"
+        return 0, info
     img8 = to_bgr8(crop)
     for side in FACE_DETECT_SIDES:
         f = min(1.0, side / max(img8.shape[:2]))
         small = cv2.resize(img8, None, fx=f, fy=f, interpolation=cv2.INTER_AREA) if f < 1 else img8
-        scores = [face_score(det, np.ascontiguousarray(np.rot90(small, k))) for k in range(4)]
+        if FACE_ENHANCE:
+            small = enhance_for_faces(small)
+        res = [face_score(det, np.ascontiguousarray(np.rot90(small, k))) for k in range(4)]
         # Decyduje najpewniejsza pojedyncza twarz (suma tylko rozstrzyga remisy) — fałszywe
         # trafienia w złej orientacji mają zwykle niską pewność, ale bywa ich kilka.
-        k = max(range(4), key=lambda i: (scores[i][1], scores[i][0]))
-        best = scores[k][1]
+        k = max(range(4), key=lambda i: (res[i][1], res[i][0]))
+        best = res[k][1]
+        info["scores"] = [r[1] for r in res]
+        info["side"] = side
         if best < FACE_MIN_CONFIDENCE:
+            if f >= 1:
+                break  # zdjęcie i tak mniejsze — większa skala nic nie da
             continue  # brak pewnej twarzy — spróbuj w większej rozdzielczości
-        return k if k and best >= scores[0][1] + FACE_ROTATION_MARGIN else 0
-    return 0
+        if k and best < res[0][1] + FACE_ROTATION_MARGIN:
+            info["reason"] = "za mala przewaga nad obecna orientacja"
+            k = 0
+        else:
+            info["reason"] = "twarz %.2f" % best
+        # Twarze we współrzędnych względnych (0..1) obrazu po obrocie o k.
+        rh, rw = np.rot90(small, k).shape[:2]
+        info["faces"] = [[x / rw, y / rh, w / rw, h / rh, sc] for x, y, w, h, sc in res[k][2]]
+        return k, info
+    return 0, info
 
 
 # -----------------------------------------------------------------------------
 # Przetwarzanie jednego skanu
 # -----------------------------------------------------------------------------
 
-def detect(img: np.ndarray) -> tuple[list[Detection], np.ndarray, np.ndarray]:
+def scale_rect(rect, f: float):
+    (cx, cy), (w, h), a = rect
+    return (cx * f, cy * f), (w * f, h * f), a
+
+
+def detect(img: np.ndarray):
+    """
+    Zwraca (detekcje w układzie pełnej rozdzielczości, maska robocza, kolor tła,
+    kopia "mid" 8-bit do podglądu, skala mid względem oryginału).
+    """
     full8 = to_bgr8(img)
     H, W = full8.shape[:2]
-    scale = min(1.0, WORK_MAX_SIDE / max(H, W))
-    work = cv2.resize(full8, (int(W * scale), int(H * scale)), interpolation=cv2.INTER_AREA) \
-        if scale < 1.0 else full8
+    # Kopia "mid" (do REFINE_MAX_SIDE px) — doprecyzowanie bez trzymania kilku kopii 400 MB w RAM.
+    s_mid = min(1.0, REFINE_MAX_SIDE / max(H, W))
+    mid = cv2.resize(full8, (round(W * s_mid), round(H * s_mid)), interpolation=cv2.INTER_AREA) \
+        if s_mid < 1.0 else full8
+    del full8
+    scale = min(1.0, WORK_MAX_SIDE / max(H, W))  # robocza względem oryginału
+    work = cv2.resize(mid, (round(W * scale), round(H * scale)), interpolation=cv2.INTER_AREA) \
+        if scale < s_mid else mid
 
-    mask, bg_lab, edges = build_foreground_mask(work)
-    edges_full = tuple(int(np.ceil(e / scale)) for e in edges)
-    coarse = [((cx / scale, cy / scale), (rw / scale, rh / scale), ang)
-              for (cx, cy), (rw, rh), ang in find_candidates(mask)]
+    mask, bg_lab, edges, gap = build_foreground_mask(work)
+    w2m = s_mid / scale  # robocza -> mid
+    edges_mid = tuple(int(np.ceil(e * w2m)) for e in edges)
+    gray = cv2.cvtColor(work, cv2.COLOR_BGR2GRAY)
+    coarse = [scale_rect(r, w2m) for r in find_candidates(mask, gap, gray)]
     dets = []
     for k, rect in enumerate(coarse):
-        if REFINE_FULL_RES and scale < 1.0:
-            rect = refine_rect(full8, rect, bg_lab, coarse[:k] + coarse[k + 1:], edges_full)
+        if REFINE_FULL_RES and w2m > 1.0:
+            rect = refine_rect(mid, rect, bg_lab, coarse[:k] + coarse[k + 1:], edges_mid)
         if GROW_TO_PAPER_EDGE:
-            rect = grow_to_paper_edge(full8, rect, bg_lab)
-        dets.append(Detection(*rect))
-    return reading_order(dets), mask, bg_lab
+            rect = grow_to_paper_edge(mid, rect, bg_lab)
+        dets.append(Detection(*scale_rect(rect, 1.0 / s_mid)))
+    return reading_order(dets), mask, bg_lab, mid, s_mid
 
 
-def save_debug(img: np.ndarray, dets: list[Detection], mask: np.ndarray, path: Path) -> None:
-    vis = to_bgr8(img).copy()
-    thick = max(2, max(vis.shape[:2]) // 400)
+def save_debug(mid: np.ndarray, s_mid: float, dets: list[Detection], mask: np.ndarray,
+               notes: list[str], path: Path) -> None:
+    """Podgląd detekcji: ramki z numerami i informacją o obrocie + maska robocza."""
+    scale = min(1.0, 2000 / max(mid.shape[:2]))
+    vis = cv2.resize(mid, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+    f = s_mid * scale
+    thick = max(2, max(vis.shape[:2]) // 500)
     for n, d in enumerate(dets, 1):
-        box = np.round(cv2.boxPoints(d.rect)).astype(np.int32)
+        box = np.round(cv2.boxPoints(scale_rect(d.rect, f))).astype(np.int32)
         cv2.polylines(vis, [box], True, (0, 0, 255), thick)
-        cv2.putText(vis, str(n), (int(d.center[0]), int(d.center[1])), cv2.FONT_HERSHEY_SIMPLEX,
-                    thick, (0, 0, 255), thick * 2)
-    scale = min(1.0, 2000 / max(vis.shape[:2]))
-    vis = cv2.resize(vis, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+        x0, y0 = box.min(axis=0)
+        label = f"{n}" + (f": {notes[n - 1]}" if n - 1 < len(notes) and notes[n - 1] else "")
+        org = (int(x0) + 8 * thick, int(y0) + 22 * thick)  # lewy górny róg ramki, wewnątrz
+        for color, t in (((255, 255, 255), thick * 4), ((0, 0, 200), thick * 2)):
+            cv2.putText(vis, label, org, cv2.FONT_HERSHEY_SIMPLEX, 0.45 * thick, color, t)
     m = cv2.resize(cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR), (vis.shape[1], vis.shape[0]))
     ok, buf = cv2.imencode(".jpg", np.hstack([vis, m]), [cv2.IMWRITE_JPEG_QUALITY, 85])
+    if ok:
+        buf.tofile(str(path))
+
+
+def face_thumb(crop: np.ndarray, k: int, info: dict, n: int, height: int = 360) -> np.ndarray:
+    """Miniatura wycinka (już obróconego) z ramkami twarzy i opisem decyzji o obrocie."""
+    img = to_bgr8(crop)
+    f = height / img.shape[0]
+    t = cv2.resize(img, (max(1, int(img.shape[1] * f)), height), interpolation=cv2.INTER_AREA)
+    t = cv2.copyMakeBorder(t, 0, 70, 0, max(0, 330 - t.shape[1]), cv2.BORDER_CONSTANT, value=(255, 255, 255))
+    th, tw = height, int(img.shape[1] * f)
+    for x, y, w, h, sc in info.get("faces", []):
+        p0, p1 = (int(x * tw), int(y * th)), (int((x + w) * tw), int((y + h) * th))
+        cv2.rectangle(t, p0, p1, (0, 220, 0), 2)
+        cv2.putText(t, "%.2f" % sc, (p0[0], max(12, p0[1] - 4)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 220, 0), 1)
+    sc = info.get("scores", [0] * 4)
+    lines = [f"#{n}: {ROTATION_NAMES[k]}  ({info.get('reason', '')})",
+             "0:%.2f  L90:%.2f  180:%.2f  P90:%.2f" % tuple(sc)]
+    for i, line in enumerate(lines):
+        cv2.putText(t, line, (6, height + 25 + 28 * i), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
+    return t
+
+
+def save_face_sheet(thumbs: list[np.ndarray], path: Path, per_row: int = 4) -> None:
+    if not thumbs:
+        return
+    rows = []
+    for i in range(0, len(thumbs), per_row):
+        row = [cv2.copyMakeBorder(t, 6, 6, 6, 6, cv2.BORDER_CONSTANT, value=(90, 90, 90)) for t in thumbs[i:i + per_row]]
+        rows.append(np.hstack(row))
+    w = max(r.shape[1] for r in rows)
+    rows = [cv2.copyMakeBorder(r, 0, 0, 0, w - r.shape[1], cv2.BORDER_CONSTANT, value=(90, 90, 90)) for r in rows]
+    ok, buf = cv2.imencode(".jpg", np.vstack(rows), [cv2.IMWRITE_JPEG_QUALITY, 85])
     if ok:
         buf.tofile(str(path))
 
@@ -700,24 +954,31 @@ def process_scan(path: Path, out_dir: Path, fmt: str, debug: bool,
         img = read_image(path)
         if img is None:
             return path.name, 0, 0, "nie można odczytać pliku"
-        dets, mask, bg_lab = detect(img)
+        dets, mask, bg_lab, mid, s_mid = detect(img)
         ext = "png" if fmt == "png" else "tif"
         saved = rotated = 0
+        notes, thumbs = [], []
         for d in dets:
             crop = extract_deskewed(img, d.rect)
             if AUTO_TRIM_BORDERS:
                 crop = auto_trim(crop, bg_lab)
             if crop.size == 0:
+                notes.append("puste")
                 continue
-            if rotate_faces:
-                k = face_orientation(crop)
-                if k:
-                    crop = np.ascontiguousarray(np.rot90(crop, k))  # obrót o 90° — bezstratny
-                    rotated += 1
+            k, info = face_orientation(crop) if rotate_faces else (0, {})
+            if k:
+                crop = np.ascontiguousarray(np.rot90(crop, k))  # obrót o 90° — bezstratny
+                rotated += 1
             saved += 1
-            write_image(out_dir / CROP_NAME_PATTERN.format(stem=path.stem, index=saved, ext=ext), crop, fmt)
+            name = CROP_NAME_PATTERN.format(stem=path.stem, index=saved, ext=ext)
+            write_image(out_dir / name, crop, fmt)
+            log.debug("%s: %s (%s)", name, ROTATION_NAMES[k], info.get("reason", "-"))
+            notes.append(f"obrot {ROTATION_NAMES[k]}" if k else "")
+            if debug and rotate_faces:
+                thumbs.append(face_thumb(crop, k, info, saved))
         if debug:
-            save_debug(img, dets, mask, out_dir / f"{path.stem}_debug.jpg")
+            save_debug(mid, s_mid, dets, mask, notes, out_dir / f"{path.stem}_debug.jpg")
+            save_face_sheet(thumbs, out_dir / f"{path.stem}_debug_twarze.jpg")
         return path.name, saved, rotated, None
     except Exception as exc:  # pojedynczy uszkodzony plik nie przerywa wsadu
         log.debug("Błąd przy %s", path, exc_info=True)
