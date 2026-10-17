@@ -13,7 +13,13 @@ skany/                         wyniki/
 
 - Obsługiwane formaty wejściowe: **TIF/TIFF, PNG, JPG/JPEG, BMP** (8 i 16 bit, kolor i skala szarości).
 - Wyjście: **PNG** (domyślnie) lub **nieskompresowany TIFF**, z zachowaniem głębi bitowej.
-- Działa na zwykłym CPU, bez GPU i bez modeli AI (OpenCV + NumPy).
+- Radzi sobie ze zdjęciami dosuniętymi do krawędzi i rogów skanu, leżącymi blisko siebie
+  (od ok. 2 mm przerwy) i z białą ramką odbitki na białym tle skanera.
+- **Automatyczna orientacja wg twarzy:** zdjęcie leżące bokiem lub do góry nogami jest
+  obracane o 90/180/270°, tak aby twarze stały pionowo (obrót o 90° jest bezstratny).
+- Działa w całości **lokalnie** na zwykłym CPU, bez GPU i bez internetu (OpenCV + NumPy;
+  detektor twarzy YuNet — plik `models/face_detection_yunet_2023mar.onnx`, 230 KB, licencja MIT,
+  dołączony do repozytorium).
 
 ---
 
@@ -170,6 +176,7 @@ python scan_autosplitter.py "C:\Users\Jan\Skany\album" "C:\Users\Jan\Skany\wynik
 | `--workers N` | liczba równoległych procesów (domyślnie: liczba rdzeni − 1) |
 | `--recursive` | przetwarzaj także podfoldery |
 | `--debug` | zapisz podgląd detekcji `<skan>_debug.jpg` (ramki na skanie + maska) |
+| `--no-face-rotate` | wyłącz automatyczne obracanie zdjęć wg twarzy |
 | `-v`, `--verbose` | szczegółowe logi |
 
 ```bash
@@ -198,14 +205,21 @@ Wszystkie parametry są stałymi na początku pliku `scan_autosplitter.py` (sekc
 | Pomija małe zdjęcia (np. legitymacyjne) | zmniejsz `MIN_AREA_FRAC` i `MIN_SIDE_FRAC` |
 | Jasne zdjęcia nie są wykrywane / są ucięte | zmniejsz `BG_DIFF_THRESHOLD` (np. 10) oraz `CANNY_LOW`/`CANNY_HIGH` (np. 20/60) |
 | Tło skanera (szum, przebarwienia) traktowane jak zdjęcie | zwiększ `BG_DIFF_THRESHOLD` (np. 18–20) |
-| Zdjęcie dosunięte do krawędzi skanu jest lekko ucięte | zmniejsz `SCANNER_EDGE_IGNORE_FRAC` (np. 0) |
-| Ciemna ramka skanera dokleja się do zdjęć | zwiększ `SCANNER_EDGE_IGNORE_FRAC` |
+| Ciemna ramka skanera dokleja się do zdjęć (ramka obejmuje pół skanu) | zmniejsz `SCANNER_EDGE_LINE_FRAC` (np. 0.85) |
+| Zdjęcie dosunięte do krawędzi skanu jest ucięte | zwiększ `SCANNER_EDGE_LINE_FRAC` (np. 0.99) |
 | Białe trójkąty / paski w rogach wycinków | zwiększ `CROP_INSET_PX` (np. 4–6) |
-| Ucina białą ramkę odbitek | ustaw `AUTO_TRIM_BORDERS = False` |
-| Dwa blisko leżące zdjęcia wycięte jako jedno | zmniejsz `CLOSE_KERNEL_FRAC` |
+| Ucina białą ramkę odbitek | zmniejsz `GROW_DELTA` (np. 2.0) |
+| Do zdjęcia doklejony pas tła | zwiększ `GROW_DELTA` (np. 5.0) lub ustaw `GROW_TO_PAPER_EDGE = False` |
+| Dwa blisko leżące zdjęcia wycięte jako jedno | zmniejsz `CLOSE_KERNEL_FRAC` (np. 0.002) |
+| Zdjęcie bez twarzy obrócone niepotrzebnie | zwiększ `FACE_MIN_CONFIDENCE` (np. 0.9) lub użyj `--no-face-rotate` |
+| Zdjęcie z twarzami nie zostało obrócone | zmniejsz `FACE_MIN_CONFIDENCE` (np. 0.7) |
 
-**Wskazówka przy skanowaniu:** zostawiaj choćby kilka milimetrów odstępu między odbitkami
-i między odbitką a krawędzią szyby — detekcja jest wtedy najdokładniejsza.
+**Wskazówka przy skanowaniu:** zostawiaj choćby 2–3 mm odstępu między odbitkami — detekcja
+jest wtedy najdokładniejsza. Zdjęcia nachodzące na siebie (bez widocznej przerwy) mogą zostać
+wycięte jako jedno.
+
+**Orientacja:** obracane są tylko zdjęcia, na których wykryto twarz. Zdjęcia bez ludzi
+(krajobrazy, budynki) zostają w orientacji, w jakiej leżały na skanerze.
 
 ---
 
@@ -265,10 +279,15 @@ Zaawansowane ustawienia systemu → Zmienne środowiskowe) lub przesunąć wła�
 ## 7. Jak to działa (w skrócie)
 
 1. Wczytanie skanu z zachowaniem głębi bitowej.
-2. Detekcja na pomniejszonej kopii: model koloru tła skanera (Lab), mapa odległości od tła
-   + krawędzie Canny, operacje morfologiczne, filtracja konturów (pole, wymiary,
-   prostokątność), rozdzielanie stykających się zdjęć (transformata odległości + watershed).
-3. Doprecyzowanie każdej ramki na pełnej rozdzielczości.
+2. Detekcja na pomniejszonej kopii: kolor tła skanera (dominujący jasny, neutralny odcień),
+   mapa odległości od tła (Lab) + krawędzie Canny, usunięcie ramki/cienia skanera, operacje
+   morfologiczne, rozdzielanie sklejonych zdjęć (transformata odległości + watershed),
+   filtracja konturów (pole, wymiary, prostokątność).
+3. Doprecyzowanie każdej ramki na pełnej rozdzielczości i dołączenie białej ramki odbitki
+   (uśrednione profile linii wzdłuż każdego boku).
 4. Prostowanie (transformacja perspektywiczna, interpolacja Lanczos). Zdjęcia leżące prosto
    (kąt < 0.05°) są tylko wycinane — piksele identyczne z oryginałem.
-5. Zapis bezstratny: PNG lub nieskompresowany TIFF.
+5. Orientacja wg twarzy: detektor YuNet sprawdza 4 obroty; zdjęcie jest obracane, gdy
+   w innej orientacji twarz jest wykrywana wyraźnie pewniej (punkty oczu/nosa/ust muszą
+   układać się pionowo).
+6. Zapis bezstratny: PNG lub nieskompresowany TIFF.
