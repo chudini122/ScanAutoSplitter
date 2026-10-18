@@ -18,11 +18,13 @@ Pipeline (klasyczne CV, OpenCV + NumPy):
        (Lanczos), opcjonalne przycięcie resztek tła na brzegach. Kąt ~0° = czyste wycięcie,
        piksele identyczne bit w bit z oryginałem.
     5. Orientacja: obrót o 90/180/270° tak, by twarze stały pionowo (detektor YuNet, lokalnie).
-    6. Zapis bezstratny (PNG / nieskompresowany TIFF) jako <skan>_crop_NN.<ext>.
+    6. Zapis (domyślnie bezstratny PNG; opcjonalnie TIFF, TIFF-LZW, JPG, WebP z limitem rozmiaru)
+       jako <skan>_crop_NN.<ext>. Tryb --no-split: tylko konwersja/kompresja całych plików.
 
 Użycie:
-    python scan_autosplitter.py WEJSCIE WYJSCIE [--format png|tiff] [--workers N] [--debug]
-                                [--no-face-rotate]
+    python scan_autosplitter.py WEJSCIE WYJSCIE [--format png|tiff|tiff-lzw|jpg|webp]
+        [--quality 1-100] [--max-mb MB] [--max-percent %] [--no-split]
+        [--workers N] [--debug] [--no-face-rotate]
 """
 
 from __future__ import annotations
@@ -55,9 +57,14 @@ except ImportError as _exc:  # najczęstszy problem przy pierwszym uruchomieniu
 
 # --- Wejście / wyjście -------------------------------------------------------
 SUPPORTED_EXTENSIONS = {".tif", ".tiff", ".png", ".jpg", ".jpeg", ".bmp"}
-OUTPUT_FORMAT = "png"            # "png" (bezstratny, kompresja Deflate) lub "tiff" (bez kompresji)
+OUTPUT_FORMAT = "png"            # bezstratne: "png", "tiff" (bez kompresji), "tiff-lzw" (bezstratna kompresja)
+                                 # stratne:    "jpg", "webp" (mniejsze pliki, jakość ustawiana --quality)
 PNG_COMPRESSION_LEVEL = 3        # 0-9; wpływa wyłącznie na rozmiar pliku i czas, NIE na jakość
+DEFAULT_QUALITY = 92             # jakość JPG/WebP (1-100), gdy nie podano --quality
+MIN_QUALITY = 50                 # przy dopasowaniu do limitu rozmiaru jakość nie spada poniżej tej wartości;
+                                 # jeśli to nie wystarczy, zmniejszana jest rozdzielczość
 CROP_NAME_PATTERN = "{stem}_crop_{index:02d}.{ext}"
+CONVERT_NAME_PATTERN = "{stem}.{ext}"   # tryb --no-split (konwersja całych plików)
 DEFAULT_WORKERS = max(1, (os.cpu_count() or 2) - 1)
 
 # --- Detekcja (na pomniejszonej kopii roboczej) ------------------------------
@@ -178,18 +185,128 @@ def read_image(path: Path) -> np.ndarray | None:
     return img
 
 
-def write_image(path: Path, img: np.ndarray, fmt: str) -> None:
-    """Zapis bezstratny: PNG (Deflate) lub TIFF bez kompresji."""
+# format: (rozszerzenie, stratny?)
+FORMATS = {"png": ("png", False), "tiff": ("tif", False), "tiff-lzw": ("tif", False),
+           "jpg": ("jpg", True), "webp": ("webp", True)}
+WEBP_MAX_SIDE = 16383  # ograniczenie formatu WebP
+MB = 1024 * 1024       # "MB" tak, jak pokazuje Eksplorator Windows
+
+
+@dataclass(frozen=True)
+class OutputOptions:
+    fmt: str = OUTPUT_FORMAT
+    quality: int | None = None        # jakość JPG/WebP 1-100
+    max_mb: float | None = None       # maks. rozmiar pliku wynikowego [MB]
+    max_percent: float | None = None  # maks. rozmiar jako % nieskompresowanego obrazu
+
+    @property
+    def ext(self) -> str:
+        return FORMATS[self.fmt][0]
+
+    @property
+    def lossy(self) -> bool:
+        return FORMATS[self.fmt][1]
+
+    def limit_bytes(self, img: np.ndarray) -> int | None:
+        limits = []
+        if self.max_mb:
+            limits.append(self.max_mb * MB)
+        if self.max_percent:
+            limits.append(img.nbytes * self.max_percent / 100.0)  # nbytes = obraz nieskompresowany
+        return int(min(limits)) if limits else None
+
+
+def to_8bit(img: np.ndarray) -> np.ndarray:
+    """JPG/WebP przyjmują tylko 8 bitów; 16-bit skalujemy (OpenCV sam by je obciął -> biały obraz)."""
+    if img.dtype == np.uint8:
+        return img
+    if img.dtype == np.uint16:
+        return (img >> 8).astype(np.uint8)
+    return cv2.normalize(img, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+
+
+def _encode(img: np.ndarray, fmt: str, quality: int = DEFAULT_QUALITY, png_level: int = PNG_COMPRESSION_LEVEL):
     if fmt == "png":
-        params = [cv2.IMWRITE_PNG_COMPRESSION, PNG_COMPRESSION_LEVEL]
-        ext = ".png"
+        ext, params = ".png", [cv2.IMWRITE_PNG_COMPRESSION, png_level]
+    elif fmt == "tiff":
+        ext, params = ".tif", [cv2.IMWRITE_TIFF_COMPRESSION, 1]  # 1 = bez kompresji
+    elif fmt == "tiff-lzw":
+        ext, params = ".tif", [cv2.IMWRITE_TIFF_COMPRESSION, 5]  # 5 = LZW (bezstratna)
+        if hasattr(cv2, "IMWRITE_TIFF_PREDICTOR"):
+            params += [cv2.IMWRITE_TIFF_PREDICTOR, 2]             # predyktor poziomy — mniejszy plik
+    elif fmt == "jpg":
+        ext, params = ".jpg", [cv2.IMWRITE_JPEG_QUALITY, int(quality), cv2.IMWRITE_JPEG_OPTIMIZE, 1]
+        if quality >= 90 and hasattr(cv2, "IMWRITE_JPEG_SAMPLING_FACTOR"):
+            # przy wysokiej jakości bez podpróbkowania koloru (4:4:4) — ostrzejsze kolorowe krawędzie
+            params += [cv2.IMWRITE_JPEG_SAMPLING_FACTOR, cv2.IMWRITE_JPEG_SAMPLING_FACTOR_444]
+    elif fmt == "webp":
+        ext, params = ".webp", [cv2.IMWRITE_WEBP_QUALITY, int(min(quality, 100))]
     else:
-        params = [cv2.IMWRITE_TIFF_COMPRESSION, 1]  # 1 = COMPRESSION_NONE
-        ext = ".tif"
+        raise ValueError(f"Nieznany format: {fmt}")
     ok, buf = cv2.imencode(ext, img, params)
     if not ok:
-        raise IOError(f"Nie udało się zakodować {path}")
+        raise IOError(f"Nie udało się zakodować obrazu do {fmt}")
+    return buf
+
+
+def encode_image(img: np.ndarray, opts: OutputOptions) -> tuple[np.ndarray, str]:
+    """
+    Koduje obraz zgodnie z opcjami. Przy limicie rozmiaru:
+      - JPG/WebP: najwyższa jakość (<= --quality), która mieści się w limicie (wyszukiwanie binarne);
+      - gdy nawet MIN_QUALITY nie wystarcza (lub format jest bezstratny) — zmniejszamy rozdzielczość.
+    Zwraca (zakodowane bajty, opis do logu).
+    """
+    limit = opts.limit_bytes(img)
+    notes = []
+    if opts.lossy:
+        img = to_8bit(img)
+    if opts.fmt == "webp" and max(img.shape[:2]) > WEBP_MAX_SIDE:
+        f = WEBP_MAX_SIDE / max(img.shape[:2])
+        img = cv2.resize(img, None, fx=f, fy=f, interpolation=cv2.INTER_AREA)
+        notes.append(f"WebP max {WEBP_MAX_SIDE}px")
+    q_top = opts.quality or (95 if limit else DEFAULT_QUALITY)
+    png_level = 6 if limit else PNG_COMPRESSION_LEVEL  # 6: prawie tak mały plik jak 9, kilka razy szybciej
+    scale, q = 1.0, q_top
+    for _ in range(8):
+        cur = img if scale >= 1.0 else cv2.resize(img, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+        buf = _encode(cur, opts.fmt, q_top, png_level)
+        q = q_top
+        if limit is None or len(buf) <= limit:
+            break
+        if opts.lossy and q_top > MIN_QUALITY:
+            low = _encode(cur, opts.fmt, MIN_QUALITY)
+            if len(low) <= limit:
+                lo, hi, buf, q = MIN_QUALITY, q_top - 1, low, MIN_QUALITY
+                while lo < hi:  # najwyższa jakość mieszcząca się w limicie
+                    mid = (lo + hi + 1) // 2
+                    b = _encode(cur, opts.fmt, mid)
+                    if len(b) <= limit:
+                        lo, buf, q = mid, b, mid
+                    else:
+                        hi = mid - 1
+                break
+            too_big, q = len(low), MIN_QUALITY
+        else:
+            too_big = len(buf)
+        scale *= float(np.sqrt(limit / too_big)) * 0.97  # rozmiar pliku ~ liczba pikseli
+    else:
+        notes.append("UWAGA: nie udało się zmieścić w limicie")
+    if opts.lossy:
+        notes.insert(0, f"jakość {q}")
+    if scale < 1.0:
+        notes.append(f"rozdzielczość {scale * 100:.0f}%")
+    return buf, ", ".join(notes)
+
+
+def write_image(path: Path, img: np.ndarray, opts: OutputOptions) -> tuple[int, str]:
+    """Zapisuje obraz; zwraca (rozmiar pliku w bajtach, opis kompresji)."""
+    buf, note = encode_image(img, opts)
     buf.tofile(str(path))
+    return len(buf), note
+
+
+def fmt_mb(n: float) -> str:
+    return f"{n / MB:.1f} MB"
 
 
 def to_bgr8(img: np.ndarray) -> np.ndarray:
@@ -946,17 +1063,16 @@ def save_face_sheet(thumbs: list[np.ndarray], path: Path, per_row: int = 4) -> N
         buf.tofile(str(path))
 
 
-def process_scan(path: Path, out_dir: Path, fmt: str, debug: bool,
-                 rotate_faces: bool = AUTO_ROTATE_FACES) -> tuple[str, int, int, str | None]:
-    """Przetwarza jeden plik. Zwraca (nazwa, liczba_zdjęć, liczba_obróconych, błąd)."""
+def process_scan(path: Path, out_dir: Path, opts: OutputOptions, debug: bool,
+                 rotate_faces: bool = AUTO_ROTATE_FACES) -> tuple[str, int, int, str | None, str]:
+    """Dzieli jeden skan. Zwraca (nazwa, liczba_zdjęć, liczba_obróconych, błąd, opis)."""
     cv2.setNumThreads(1)  # równoległość zapewnia pula procesów
     try:
         img = read_image(path)
         if img is None:
-            return path.name, 0, 0, "nie można odczytać pliku"
+            return path.name, 0, 0, "nie można odczytać pliku", ""
         dets, mask, bg_lab, mid, s_mid = detect(img)
-        ext = "png" if fmt == "png" else "tif"
-        saved = rotated = 0
+        saved = rotated = out_bytes = 0
         notes, thumbs = [], []
         for d in dets:
             crop = extract_deskewed(img, d.rect)
@@ -970,35 +1086,68 @@ def process_scan(path: Path, out_dir: Path, fmt: str, debug: bool,
                 crop = np.ascontiguousarray(np.rot90(crop, k))  # obrót o 90° — bezstratny
                 rotated += 1
             saved += 1
-            name = CROP_NAME_PATTERN.format(stem=path.stem, index=saved, ext=ext)
-            write_image(out_dir / name, crop, fmt)
-            log.debug("%s: %s (%s)", name, ROTATION_NAMES[k], info.get("reason", "-"))
+            name = CROP_NAME_PATTERN.format(stem=path.stem, index=saved, ext=opts.ext)
+            size, note = write_image(out_dir / name, crop, opts)
+            out_bytes += size
+            log.debug("%s: %s, %s (%s) — %s", name, fmt_mb(size), note or opts.fmt,
+                      ROTATION_NAMES[k], info.get("reason", "-"))
             notes.append(f"obrot {ROTATION_NAMES[k]}" if k else "")
             if debug and rotate_faces:
                 thumbs.append(face_thumb(crop, k, info, saved))
         if debug:
             save_debug(mid, s_mid, dets, mask, notes, out_dir / f"{path.stem}_debug.jpg")
             save_face_sheet(thumbs, out_dir / f"{path.stem}_debug_twarze.jpg")
-        return path.name, saved, rotated, None
+        return path.name, saved, rotated, None, f"razem {fmt_mb(out_bytes)}"
     except Exception as exc:  # pojedynczy uszkodzony plik nie przerywa wsadu
         log.debug("Błąd przy %s", path, exc_info=True)
-        return path.name, 0, 0, f"{type(exc).__name__}: {exc}"
+        return path.name, 0, 0, f"{type(exc).__name__}: {exc}", ""
+
+
+def process_convert(path: Path, out_dir: Path, opts: OutputOptions) -> tuple[str, int, int, str | None, str]:
+    """Tryb --no-split: zapisuje cały plik w wybranym formacie / rozmiarze, bez dzielenia."""
+    cv2.setNumThreads(1)
+    try:
+        img = read_image(path)
+        if img is None:
+            return path.name, 0, 0, "nie można odczytać pliku", ""
+        out = out_dir / CONVERT_NAME_PATTERN.format(stem=path.stem, ext=opts.ext)
+        if out.resolve() == path.resolve():  # nie nadpisujemy oryginału
+            out = out.with_name(f"{path.stem}_konw.{opts.ext}")
+        size, note = write_image(out, img, opts)
+        desc = f"{fmt_mb(path.stat().st_size)} -> {fmt_mb(size)} ({opts.fmt}{', ' + note if note else ''})"
+        return path.name, 1, 0, None, desc
+    except Exception as exc:
+        log.debug("Błąd przy %s", path, exc_info=True)
+        return path.name, 0, 0, f"{type(exc).__name__}: {exc}", ""
 
 
 # -----------------------------------------------------------------------------
 # CLI / batch
 # -----------------------------------------------------------------------------
 
-def collect_inputs(in_dir: Path, recursive: bool) -> list[Path]:
-    it = in_dir.rglob("*") if recursive else in_dir.iterdir()
-    return sorted(p for p in it if p.is_file() and p.suffix.lower() in SUPPORTED_EXTENSIONS)
+def collect_inputs(source: Path, recursive: bool, exclude: Path | None = None) -> list[Path]:
+    """Pojedynczy plik albo obrazy z folderu (z pominięciem folderu wynikowego)."""
+    if source.is_file():
+        return [source]
+    it = source.rglob("*") if recursive else source.iterdir()
+    ex = exclude.resolve() if exclude else None
+    return sorted(p for p in it if p.is_file() and p.suffix.lower() in SUPPORTED_EXTENSIONS
+                  and not (ex and ex in p.resolve().parents))
 
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="Automatyczne dzielenie skanów na pojedyncze, wyprostowane zdjęcia.")
-    ap.add_argument("input", type=Path, help="folder ze skanami")
+    ap.add_argument("input", type=Path, help="folder ze skanami albo pojedynczy plik")
     ap.add_argument("output", type=Path, help="folder wynikowy")
-    ap.add_argument("--format", choices=["png", "tiff"], default=OUTPUT_FORMAT, help="format bezstratny")
+    ap.add_argument("--format", choices=list(FORMATS), default=OUTPUT_FORMAT,
+                    help="png / tiff / tiff-lzw (bezstratne), jpg / webp (stratne, mniejsze)")
+    ap.add_argument("--quality", type=int, metavar="1-100",
+                    help=f"jakość JPG/WebP (domyślnie {DEFAULT_QUALITY}; z limitem rozmiaru: najwyższa mieszcząca się)")
+    ap.add_argument("--max-mb", type=float, metavar="MB", help="maksymalny rozmiar każdego pliku wynikowego w MB")
+    ap.add_argument("--max-percent", type=float, metavar="%",
+                    help="maksymalny rozmiar pliku jako %% rozmiaru nieskompresowanego obrazu (np. 10)")
+    ap.add_argument("--no-split", action="store_true",
+                    help="nie dziel skanów — tylko zapisz całe pliki w wybranym formacie/rozmiarze")
     ap.add_argument("--workers", type=int, default=DEFAULT_WORKERS, help="liczba procesów")
     ap.add_argument("--recursive", action="store_true", help="przeszukuj podfoldery")
     ap.add_argument("--debug", action="store_true", help="zapisz podgląd detekcji (*_debug.jpg)")
@@ -1010,45 +1159,73 @@ def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
                         format="%(asctime)s %(levelname)-7s %(message)s", datefmt="%H:%M:%S")
 
-    if not args.input.is_dir():
-        log.error("Folder wejściowy nie istnieje: %s", args.input)
+    if not args.input.exists():
+        log.error("Wejście nie istnieje: %s", args.input)
         return 2
+    if args.quality is not None and not 1 <= args.quality <= 100:
+        ap.error("--quality musi być w zakresie 1-100")
+    if args.max_percent is not None and not 0 < args.max_percent <= 100:
+        ap.error("--max-percent musi być w zakresie (0, 100]")
+    if args.max_mb is not None and args.max_mb <= 0:
+        ap.error("--max-mb musi być większe od 0")
+    opts = OutputOptions(args.format, args.quality, args.max_mb, args.max_percent)
+    if args.quality is not None and not opts.lossy:
+        log.warning("--quality dotyczy tylko jpg/webp — dla %s jest ignorowane (format bezstratny)", args.format)
+    if (args.max_mb or args.max_percent) and not opts.lossy:
+        log.warning("Format %s jest bezstratny: limit rozmiaru da się osiągnąć tylko zmniejszając "
+                    "rozdzielczość. Użyj --format jpg lub webp, aby zachować pełną rozdzielczość.", args.format)
+
     args.output.mkdir(parents=True, exist_ok=True)
-    files = collect_inputs(args.input, args.recursive)
+    files = collect_inputs(args.input, args.recursive, exclude=args.output)
     if not files:
         log.warning("Brak obsługiwanych plików w %s", args.input)
         return 0
 
-    if args.rotate_faces and not FACE_MODEL_PATH.is_file():
+    if args.rotate_faces and not args.no_split and not FACE_MODEL_PATH.is_file():
         log.warning("Brak modelu twarzy %s — automatyczna orientacja wyłączona", FACE_MODEL_PATH)
         args.rotate_faces = False
-    log.info("Skanów: %d | format: %s | procesy: %d | orientacja wg twarzy: %s",
-             len(files), args.format, args.workers, "tak" if args.rotate_faces else "nie")
+    limit = " | ".join(x for x in (f"max {args.max_mb} MB" if args.max_mb else "",
+                                   f"max {args.max_percent}% oryginału" if args.max_percent else "",
+                                   f"jakość {args.quality}" if args.quality else "") if x)
+    log.info("Plików: %d | tryb: %s | format: %s%s | procesy: %d%s", len(files),
+             "konwersja (bez dzielenia)" if args.no_split else "dzielenie",
+             args.format, f" ({limit})" if limit else "", args.workers,
+             "" if args.no_split else f" | orientacja wg twarzy: {'tak' if args.rotate_faces else 'nie'}")
     t0, total, total_rot, failed = time.perf_counter(), 0, 0, 0
 
-    def report(name, n, rot, err):
+    def report(name, n, rot, err, desc):
         nonlocal total, total_rot, failed
         if err:
             failed += 1
             log.error("%-40s BŁĄD: %s", name, err)
+        elif args.no_split:
+            total += n
+            log.info("%-40s %s", name, desc)
         else:
             total += n
             total_rot += rot
             extra = f" (obrócone wg twarzy: {rot})" if rot else ""
-            (log.warning if n == 0 else log.info)("%-40s zdjęć: %d%s", name, n, extra)
+            (log.warning if n == 0 else log.info)("%-40s zdjęć: %d%s, %s", name, n, extra, desc)
 
-    job = (args.output, args.format, args.debug, args.rotate_faces)
+    if args.no_split:
+        func, job = process_convert, (args.output, opts)
+    else:
+        func, job = process_scan, (args.output, opts, args.debug, args.rotate_faces)
     if args.workers <= 1:
         for f in files:
-            report(*process_scan(f, *job))
+            report(*func(f, *job))
     else:
         with ProcessPoolExecutor(max_workers=args.workers) as pool:
-            futures = [pool.submit(process_scan, f, *job) for f in files]
+            futures = [pool.submit(func, f, *job) for f in files]
             for fut in as_completed(futures):
                 report(*fut.result())
 
-    log.info("Gotowe: %d zdjęć z %d skanów w %.1fs (obrócone: %d, błędy: %d)",
-             total, len(files), time.perf_counter() - t0, total_rot, failed)
+    if args.no_split:
+        log.info("Gotowe: %d z %d plików w %.1fs (błędy: %d)", total, len(files),
+                 time.perf_counter() - t0, failed)
+    else:
+        log.info("Gotowe: %d zdjęć z %d skanów w %.1fs (obrócone: %d, błędy: %d)",
+                 total, len(files), time.perf_counter() - t0, total_rot, failed)
     return 1 if failed else 0
 
 

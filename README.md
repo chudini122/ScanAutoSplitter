@@ -12,7 +12,10 @@ skany/                         wyniki/
 ```
 
 - Obsługiwane formaty wejściowe: **TIF/TIFF, PNG, JPG/JPEG, BMP** (8 i 16 bit, kolor i skala szarości).
-- Wyjście: **PNG** (domyślnie) lub **nieskompresowany TIFF**, z zachowaniem głębi bitowej.
+- Wyjście: **PNG** (domyślnie, bezstratny), **TIFF** (bez kompresji lub bezstratny LZW) albo
+  **JPG / WebP** z wybraną jakością lub **limitem rozmiaru pliku** (w MB albo w % oryginału).
+- Tryb **`--no-split`**: bez dzielenia — tylko konwersja/kompresja całych skanów (np. 400 MB TIFF
+  → JPG do 20 MB).
 - Radzi sobie ze zdjęciami dosuniętymi do krawędzi i rogów skanu, leżącymi blisko siebie
   (od ok. 2 mm przerwy) i z białą ramką odbitki na białym tle skanera.
 - **Automatyczna orientacja wg twarzy:** zdjęcie leżące bokiem lub do góry nogami jest
@@ -152,7 +155,8 @@ Jeśli oba polecenia działają bez błędów — wszystko gotowe.
 
 ## 4. Uruchomienie
 
-Podstawowe użycie: podaj folder ze skanami i folder na wyniki (zostanie utworzony automatycznie).
+Podstawowe użycie: podaj folder ze skanami (albo pojedynczy plik) i folder na wyniki
+(zostanie utworzony automatycznie).
 
 ```bash
 python scan_autosplitter.py ŚCIEŻKA_DO_SKANÓW ŚCIEŻKA_DO_WYNIKÓW
@@ -172,7 +176,11 @@ python scan_autosplitter.py "C:\Users\Jan\Skany\album" "C:\Users\Jan\Skany\wynik
 
 | Opcja | Opis |
 |---|---|
-| `--format png` / `--format tiff` | format wyjściowy (domyślnie `png`; `tiff` = bez kompresji) |
+| `--format FORMAT` | format wyjściowy — patrz tabela niżej (domyślnie `png`) |
+| `--quality 1-100` | jakość JPG/WebP (domyślnie 92; wyżej = lepiej i większy plik) |
+| `--max-mb MB` | maksymalny rozmiar **każdego** pliku wynikowego, np. `--max-mb 10` |
+| `--max-percent %` | maksymalny rozmiar pliku jako % obrazu nieskompresowanego, np. `--max-percent 5` |
+| `--no-split` | nie dziel skanów — zapisz całe pliki w wybranym formacie / rozmiarze |
 | `--workers N` | liczba równoległych procesów (domyślnie: liczba rdzeni − 1) |
 | `--recursive` | przetwarzaj także podfoldery |
 | `--debug` | zapisz podglądy: `<skan>_debug.jpg` (ramki, numery i obroty na skanie + maska) oraz `<skan>_debug_twarze.jpg` (wycinki po obrocie z zaznaczonymi twarzami i pewnością dla każdej orientacji) |
@@ -182,6 +190,61 @@ python scan_autosplitter.py "C:\Users\Jan\Skany\album" "C:\Users\Jan\Skany\wynik
 ```bash
 # TIFF, 4 procesy, z podglądem detekcji
 python scan_autosplitter.py skany wyniki --format tiff --workers 4 --debug
+```
+
+### Format i rozmiar plików wynikowych
+
+| `--format` | Rodzaj | Uwagi |
+|---|---|---|
+| `png` | bezstratny | domyślny; zachowuje 16 bit |
+| `tiff` | bezstratny, bez kompresji | największe pliki; zachowuje 16 bit |
+| `tiff-lzw` | bezstratny, kompresja LZW | zwykle 30–60% mniejszy niż `tiff`; zachowuje 16 bit |
+| `jpg` | stratny | najmniejsze pliki, otwiera się wszędzie; zapis w 8 bitach |
+| `webp` | stratny | ok. 25–35% mniejszy niż JPG przy tej samej jakości; wolniejszy zapis; maks. 16383 px na bok |
+
+Jak działają limity rozmiaru (`--max-mb`, `--max-percent`; jeśli podasz oba, obowiązuje mniejszy):
+
+- **JPG / WebP:** program wybiera **najwyższą jakość**, przy której plik mieści się w limicie
+  (nie wyżej niż `--quality`, jeśli ją podano). Gdy nawet jakość 50 nie wystarcza, zmniejsza
+  rozdzielczość tylko tyle, ile trzeba.
+- **PNG / TIFF** (bezstratne): jakości nie da się obniżyć, więc limit jest osiągany wyłącznie
+  przez zmniejszenie rozdzielczości — program o tym ostrzega.
+- W logu widać wynik dla każdego pliku, np. `100.3 MB -> 17.8 MB (jpg, jakość 94)` albo
+  `... (png, rozdzielczość 72%)`.
+
+`--max-percent` odnosi się do obrazu **nieskompresowanego** (szerokość × wysokość × kanały ×
+bajty na kanał) — dla skanu zapisanego jako nieskompresowany TIFF to praktycznie rozmiar pliku.
+
+### Tryb bez dzielenia (`--no-split`) — konwersja i kompresja całych skanów
+
+Bierze cały plik (lub wszystkie pliki z folderu), **nie wycina zdjęć**, i zapisuje go w wybranym
+formacie i rozmiarze. Nazwa wyniku: `[nazwa_pliku].[rozszerzenie]`. Oryginał nigdy nie jest
+nadpisywany (przy tej samej nazwie i folderze dostaje dopisek `_konw`).
+
+```bat
+:: jeden skan 400 MB -> JPG o rozmiarze maks. 20 MB
+python scan_autosplitter.py "D:\skany\zdjecie_0001.tif" "D:\skany\male" --no-split --format jpg --max-mb 20
+
+:: cały folder -> JPG o jakości 85
+python scan_autosplitter.py "D:\skany" "D:\skany\jpg" --no-split --format jpg --quality 85
+
+:: cały folder -> WebP, każdy plik maks. 5% rozmiaru oryginału
+python scan_autosplitter.py "D:\skany" "D:\skany\webp" --no-split --format webp --max-percent 5
+
+:: bezstratnie, ale mniejszy plik (TIFF z kompresją LZW)
+python scan_autosplitter.py "D:\skany" "D:\skany\lzw" --no-split --format tiff-lzw
+```
+
+### Dzielenie z kompresją
+
+Te same opcje działają przy dzieleniu skanów — limit dotyczy **każdego wyciętego zdjęcia**:
+
+```bat
+:: każde wycięte zdjęcie jako JPG maks. 5 MB
+python scan_autosplitter.py "D:\skany" "D:\skany\zdjecia" --format jpg --max-mb 5
+
+:: każde zdjęcie jako WebP o jakości 90
+python scan_autosplitter.py "D:\skany" "D:\skany\zdjecia" --format webp --quality 90
 ```
 
 ### Wyniki
@@ -313,4 +376,4 @@ Zaawansowane ustawienia systemu → Zmienne środowiskowe) lub przesunąć wła�
 5. Orientacja wg twarzy: detektor YuNet sprawdza 4 obroty; zdjęcie jest obracane, gdy
    w innej orientacji twarz jest wykrywana wyraźnie pewniej (punkty oczu/nosa/ust muszą
    układać się pionowo).
-6. Zapis bezstratny: PNG lub nieskompresowany TIFF.
+6. Zapis: domyślnie bezstratny PNG; opcjonalnie TIFF, TIFF-LZW, JPG lub WebP (z limitem rozmiaru).
