@@ -181,7 +181,7 @@ python scan_autosplitter.py "C:\Users\Jan\Skany\album" "C:\Users\Jan\Skany\wynik
 | `--max-mb MB` | maksymalny rozmiar **każdego** pliku wynikowego, np. `--max-mb 10` |
 | `--max-percent %` | maksymalny rozmiar pliku jako % obrazu nieskompresowanego, np. `--max-percent 5` |
 | `--no-split` | nie dziel skanów — zapisz całe pliki w wybranym formacie / rozmiarze |
-| `--workers N` | liczba równoległych procesów (domyślnie: liczba rdzeni − 1) |
+| `--workers N` | liczba równoległych procesów (domyślnie dobierana automatycznie do wolnej pamięci RAM, maks. 6) |
 | `--recursive` | przetwarzaj także podfoldery |
 | `--debug` | zapisz podglądy: `<skan>_debug.jpg` (ramki, numery i obroty na skanie + maska) oraz `<skan>_debug_twarze.jpg` (wycinki po obrocie z zaznaczonymi twarzami i pewnością dla każdej orientacji) |
 | `--no-face-rotate` | wyłącz automatyczne obracanie zdjęć wg twarzy |
@@ -268,9 +268,17 @@ python scan_autosplitter.py "D:\skany" "D:\skany\zdjecia" --format webp --qualit
 
 ### Duże skany (1200 dpi) i pamięć RAM
 
-Skan A4 w 1200 dpi to ok. 400 MB w pamięci; jeden proces zużywa ok. 1.6 GB RAM
-i przetwarza skan w ok. 30 s. Przy `--workers 4` potrzeba więc ok. 6–7 GB wolnej pamięci —
-jeśli komputer ma mniej RAM, użyj `--workers 2`.
+Skan A4 w 1200 dpi to ok. 400 MB w pamięci. Jeden proces potrzebuje ok. 1.1 GB RAM przy
+konwersji (`--no-split`) i ok. 1.4 GB przy dzieleniu.
+
+- **Liczba procesów jest dobierana automatycznie** na podstawie wolnej pamięci RAM i rozmiaru
+  obrazów (odczytanego z nagłówków plików) — widać to w pierwszej linii logu, np.
+  `procesy: 5 (automatycznie: wolne RAM 9.8 GB, ok. 1.1 GB na proces)`.
+- Jeśli mimo to zabraknie pamięci (np. inne programy zajmą RAM w trakcie), program **nie
+  przerywa pracy**: pliki, które się nie zmieściły, ponawia automatycznie z o połowę mniejszą
+  liczbą procesów, aż do jednego.
+- Ręczne `--workers N` jest respektowane, ale program ostrzeże, jeśli N jest większe niż
+  bezpieczna liczba dla dostępnej pamięci.
 
 ---
 
@@ -314,6 +322,7 @@ jako jedno — zostaw między nimi choćby minimalny odstęp.
 | `'python' is not recognized…` (Windows) | zainstaluj Pythona z opcją „Add to PATH” lub użyj `py` zamiast `python` |
 | `externally-managed-environment` (Linux) | użyj środowiska wirtualnego (wariant 1) |
 | `nie można odczytać pliku` | plik jest uszkodzony lub to nie jest obraz |
+| `Insufficient memory — za mało pamięci RAM` | zamknij inne programy albo uruchom z `--workers 1` (program i tak ponawia takie pliki z mniejszą liczbą procesów) |
 | Brak wyników dla skanu (`zdjęć: 0`) | uruchom z `--debug` i dostrój parametry (sekcja 5) |
 
 ---

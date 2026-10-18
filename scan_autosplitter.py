@@ -36,6 +36,7 @@ import sys
 import time
 import warnings
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures.process import BrokenProcessPool
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -65,7 +66,15 @@ MIN_QUALITY = 50                 # przy dopasowaniu do limitu rozmiaru jakość 
                                  # jeśli to nie wystarczy, zmniejszana jest rozdzielczość
 CROP_NAME_PATTERN = "{stem}_crop_{index:02d}.{ext}"
 CONVERT_NAME_PATTERN = "{stem}.{ext}"   # tryb --no-split (konwersja całych plików)
-DEFAULT_WORKERS = max(1, (os.cpu_count() or 2) - 1)
+MAX_AUTO_WORKERS = 6             # górny limit procesów dobieranych automatycznie (dysk i RAM i tak ograniczają)
+RAM_USE_FRAC = 0.75              # automatyczny dobór procesów korzysta najwyżej z tej części wolnej pamięci
+# Szacowane zużycie RAM na proces jako wielokrotność rozmiaru obrazu po wczytaniu (+ stały narzut);
+# zmierzone dla skanu A4 1200 dpi (410 MB): wczytanie TIFF ~2x, dzielenie ~2.3x.
+MEM_FACTOR_SPLIT = 3.0           # dzielenie: obraz, kopie robocze, wycinki
+MEM_FACTOR_CONVERT = 2.3         # --no-split: obraz + bufor dekodera + plik wynikowy
+MEM_OVERHEAD = 200 * 1024 * 1024  # Python + OpenCV w każdym procesie
+JPEG_OPTIMIZE_MAX_PIXELS = 40_000_000  # optymalizacja Huffmana JPG tylko dla mniejszych obrazów
+                                       # (dla 140 Mpx: +440 MB RAM i 5x dłużej za ~2% mniejszy plik)
 
 # --- Detekcja (na pomniejszonej kopii roboczej) ------------------------------
 # Rozmiary jąder morfologicznych są ułamkiem DŁUŻSZEGO BOKU SKANU, więc nie zależą od DPI.
@@ -174,8 +183,13 @@ class Detection:
 
 def read_image(path: Path) -> np.ndarray | None:
     """Wczytuje obraz bez utraty głębi bitowej i kanałów."""
-    data = np.fromfile(str(path), dtype=np.uint8)
-    img = cv2.imdecode(data, cv2.IMREAD_UNCHANGED)
+    if str(path).isascii():
+        img = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)  # bez dodatkowej kopii pliku w RAM
+    else:
+        # cv2.imread nie obsługuje polskich znaków w ścieżce na Windows — czytamy bajty i dekodujemy
+        data = np.fromfile(str(path), dtype=np.uint8)
+        img = cv2.imdecode(data, cv2.IMREAD_UNCHANGED)
+        del data
     if img is None:
         return None
     if img.ndim == 2:
@@ -235,7 +249,9 @@ def _encode(img: np.ndarray, fmt: str, quality: int = DEFAULT_QUALITY, png_level
         if hasattr(cv2, "IMWRITE_TIFF_PREDICTOR"):
             params += [cv2.IMWRITE_TIFF_PREDICTOR, 2]             # predyktor poziomy — mniejszy plik
     elif fmt == "jpg":
-        ext, params = ".jpg", [cv2.IMWRITE_JPEG_QUALITY, int(quality), cv2.IMWRITE_JPEG_OPTIMIZE, 1]
+        ext, params = ".jpg", [cv2.IMWRITE_JPEG_QUALITY, int(quality)]
+        if img.shape[0] * img.shape[1] <= JPEG_OPTIMIZE_MAX_PIXELS:
+            params += [cv2.IMWRITE_JPEG_OPTIMIZE, 1]
         if quality >= 90 and hasattr(cv2, "IMWRITE_JPEG_SAMPLING_FACTOR"):
             # przy wysokiej jakości bez podpróbkowania koloru (4:4:4) — ostrzejsze kolorowe krawędzie
             params += [cv2.IMWRITE_JPEG_SAMPLING_FACTOR, cv2.IMWRITE_JPEG_SAMPLING_FACTOR_444]
@@ -1100,7 +1116,7 @@ def process_scan(path: Path, out_dir: Path, opts: OutputOptions, debug: bool,
         return path.name, saved, rotated, None, f"razem {fmt_mb(out_bytes)}"
     except Exception as exc:  # pojedynczy uszkodzony plik nie przerywa wsadu
         log.debug("Błąd przy %s", path, exc_info=True)
-        return path.name, 0, 0, f"{type(exc).__name__}: {exc}", ""
+        return path.name, 0, 0, describe_error(exc), ""
 
 
 def process_convert(path: Path, out_dir: Path, opts: OutputOptions) -> tuple[str, int, int, str | None, str]:
@@ -1118,12 +1134,172 @@ def process_convert(path: Path, out_dir: Path, opts: OutputOptions) -> tuple[str
         return path.name, 1, 0, None, desc
     except Exception as exc:
         log.debug("Błąd przy %s", path, exc_info=True)
-        return path.name, 0, 0, f"{type(exc).__name__}: {exc}", ""
+        return path.name, 0, 0, describe_error(exc), ""
 
 
 # -----------------------------------------------------------------------------
 # CLI / batch
 # -----------------------------------------------------------------------------
+
+def available_memory() -> int | None:
+    """Wolna pamięć RAM w bajtach (Windows / Linux / macOS) albo None, gdy nie da się ustalić."""
+    try:
+        if sys.platform == "win32":
+            import ctypes
+
+            class MemStatus(ctypes.Structure):
+                _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
+                            ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
+                            ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
+                            ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
+                            ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+            st = MemStatus()
+            st.dwLength = ctypes.sizeof(st)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(st)):
+                return int(st.ullAvailPhys)
+            return None
+        if os.path.exists("/proc/meminfo"):
+            with open("/proc/meminfo") as f:
+                for line in f:
+                    if line.startswith("MemAvailable:"):
+                        return int(line.split()[1]) * 1024
+        return os.sysconf("SC_AVPHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
+    except (OSError, ValueError, AttributeError):
+        return None
+
+
+def image_header_size(path: Path) -> int | None:
+    """
+    Rozmiar obrazu po wczytaniu (szer. x wys. x kanały x bajty) odczytany z nagłówka pliku,
+    bez dekodowania pikseli. Obsługuje TIFF, PNG i JPEG; None, gdy się nie da.
+    """
+    import struct
+    try:
+        with open(path, "rb") as f:
+            head = f.read(32)
+            if head[:8] == b"\x89PNG\r\n\x1a\n":
+                w, h, depth, ctype = struct.unpack(">IIBB", head[16:26])
+                ch = {0: 1, 2: 3, 3: 3, 4: 2, 6: 4}.get(ctype, 3)
+                return w * h * ch * max(1, depth // 8)
+            if head[:2] in (b"II", b"MM"):
+                e = "<" if head[:2] == b"II" else ">"
+                if struct.unpack(e + "H", head[2:4])[0] != 42:
+                    return None  # BigTIFF itp.
+                f.seek(struct.unpack(e + "I", head[4:8])[0])
+                n = struct.unpack(e + "H", f.read(2))[0]
+                tags = {}
+                for _ in range(n):
+                    tag, typ, cnt, val = struct.unpack(e + "HHI4s", f.read(12))
+                    if typ == 3 and cnt * 2 > 4:  # tablica SHORT poza wpisem (np. BitsPerSample RGB)
+                        pos = f.tell()
+                        f.seek(struct.unpack(e + "I", val)[0])
+                        v = struct.unpack(e + "H", f.read(2))[0]
+                        f.seek(pos)
+                    elif typ == 3:
+                        v = struct.unpack(e + "H", val[:2])[0]
+                    else:
+                        v = struct.unpack(e + "I", val)[0]
+                    tags[tag] = v
+                w, h = tags[256], tags[257]
+                return w * h * tags.get(277, 1) * max(1, tags.get(258, 8) // 8)
+            if head[:2] == b"\xff\xd8":
+                f.seek(2)
+                while True:
+                    marker, length = struct.unpack(">2sH", f.read(4))
+                    if marker[0] != 0xFF:
+                        return None
+                    if marker[1] in (0xC0, 0xC1, 0xC2):
+                        _, h, w, ch = struct.unpack(">BHHB", f.read(6))
+                        return w * h * ch
+                    f.seek(length - 2, 1)
+    except (OSError, KeyError, struct.error, IndexError):
+        return None
+    return None
+
+
+def estimated_image_bytes(path: Path) -> int:
+    """Przybliżony rozmiar obrazu po wczytaniu — z nagłówka, a gdy się nie da, z rozmiaru pliku."""
+    size = image_header_size(path)
+    if size:
+        return size
+    factor = {".jpg": 10, ".jpeg": 10, ".png": 3, ".tif": 3, ".tiff": 3}.get(path.suffix.lower(), 1)
+    return path.stat().st_size * factor
+
+
+def choose_workers(files: list[Path], requested: int | None, no_split: bool) -> tuple[int, str]:
+    """Liczba procesów: podana przez użytkownika albo dobrana do wolnej pamięci RAM i liczby rdzeni."""
+    cpu = max(1, (os.cpu_count() or 2) - 1)
+    per_worker = MEM_OVERHEAD + (MEM_FACTOR_CONVERT if no_split else MEM_FACTOR_SPLIT) * \
+        max(estimated_image_bytes(f) for f in files)
+    free = available_memory()
+    fit = max(1, int(free * RAM_USE_FRAC // per_worker)) if free else None
+    note = (f"wolne RAM {free / 2**30:.1f} GB, ok. {per_worker / 2**30:.1f} GB na proces"
+            if free else "nie udało się odczytać wolnej pamięci RAM")
+    if requested:
+        if fit and requested > fit:
+            log.warning("--workers %d może przekroczyć pamięć RAM (%s; bezpiecznie: %d). "
+                        "W razie braku pamięci pliki zostaną ponowione z mniejszą liczbą procesów.",
+                        requested, note, fit)
+        return requested, "ustawione ręcznie"
+    workers = min(cpu, MAX_AUTO_WORKERS, len(files), fit or 2)
+    return max(1, workers), f"automatycznie: {note}"
+
+
+def describe_error(exc: BaseException) -> str:
+    """Krótki, czytelny opis błędu (komunikaty OpenCV są wielowierszowe i techniczne)."""
+    text = " ".join(str(exc).split())
+    if isinstance(exc, MemoryError) or "Insufficient memory" in text or "Failed to allocate" in text:
+        import re
+        m = re.search(r"allocate (\d+) bytes", text)
+        need = f" (potrzeba {int(m.group(1)) / MB:.0f} MB)" if m else ""
+        return (f"Insufficient memory — za mało pamięci RAM{need}. Zamknij inne programy "
+                f"albo uruchom z --workers 1.")
+    return f"{type(exc).__name__}: {text}"
+
+
+def is_memory_error(err: str | None) -> bool:
+    return bool(err) and any(t in err for t in ("Insufficient memory", "MemoryError", "bad_alloc",
+                                                  "Failed to allocate", "out of memory"))
+
+
+def run_batch(func, job: tuple, files: list[Path], workers: int, report) -> None:
+    """
+    Przetwarza pliki równolegle. Gdy proces zabraknie pamięci (błąd alokacji albo nagłe
+    zakończenie procesu przez system), dotknięte pliki są ponawiane z o połowę mniejszą
+    liczbą procesów — aż do przetwarzania pojedynczo. Jeden problem nie przerywa całości.
+    """
+    pending = list(files)
+    while pending:
+        if workers <= 1:
+            for f in pending:
+                report(*func(f, *job))
+            return
+        retry, finished = [], set()
+        try:
+            with ProcessPoolExecutor(max_workers=workers) as pool:
+                futures = {pool.submit(func, f, *job): f for f in pending}
+                for fut in as_completed(futures):
+                    f = futures[fut]
+                    finished.add(f)
+                    try:
+                        res = fut.result()
+                    except BrokenProcessPool:
+                        retry.append(f)  # proces zabity (np. przez system przy braku RAM)
+                        continue
+                    if is_memory_error(res[3]):
+                        retry.append(f)
+                        continue
+                    report(*res)
+        except BrokenProcessPool:
+            pass  # zamykanie zepsutej puli
+        retry += [f for f in pending if f not in finished]  # nieukończone z dowolnego powodu
+        if not retry:
+            return
+        workers = max(1, workers // 2)
+        log.warning("Za mało pamięci RAM — ponawiam nieprzetworzone pliki (%d), liczba procesów: %d",
+                    len(retry), workers)
+        pending = sorted(set(retry))
+
 
 def collect_inputs(source: Path, recursive: bool, exclude: Path | None = None) -> list[Path]:
     """Pojedynczy plik albo obrazy z folderu (z pominięciem folderu wynikowego)."""
@@ -1148,7 +1324,8 @@ def main(argv: list[str] | None = None) -> int:
                     help="maksymalny rozmiar pliku jako %% rozmiaru nieskompresowanego obrazu (np. 10)")
     ap.add_argument("--no-split", action="store_true",
                     help="nie dziel skanów — tylko zapisz całe pliki w wybranym formacie/rozmiarze")
-    ap.add_argument("--workers", type=int, default=DEFAULT_WORKERS, help="liczba procesów")
+    ap.add_argument("--workers", type=int, default=None,
+                    help="liczba równoległych procesów (domyślnie: dobierana do wolnej pamięci RAM)")
     ap.add_argument("--recursive", action="store_true", help="przeszukuj podfoldery")
     ap.add_argument("--debug", action="store_true", help="zapisz podgląd detekcji (*_debug.jpg)")
     ap.add_argument("--no-face-rotate", dest="rotate_faces", action="store_false",
@@ -1187,9 +1364,10 @@ def main(argv: list[str] | None = None) -> int:
     limit = " | ".join(x for x in (f"max {args.max_mb} MB" if args.max_mb else "",
                                    f"max {args.max_percent}% oryginału" if args.max_percent else "",
                                    f"jakość {args.quality}" if args.quality else "") if x)
-    log.info("Plików: %d | tryb: %s | format: %s%s | procesy: %d%s", len(files),
+    workers, why = choose_workers(files, args.workers, args.no_split)
+    log.info("Plików: %d | tryb: %s | format: %s%s | procesy: %d (%s)%s", len(files),
              "konwersja (bez dzielenia)" if args.no_split else "dzielenie",
-             args.format, f" ({limit})" if limit else "", args.workers,
+             args.format, f" ({limit})" if limit else "", workers, why,
              "" if args.no_split else f" | orientacja wg twarzy: {'tak' if args.rotate_faces else 'nie'}")
     t0, total, total_rot, failed = time.perf_counter(), 0, 0, 0
 
@@ -1211,14 +1389,7 @@ def main(argv: list[str] | None = None) -> int:
         func, job = process_convert, (args.output, opts)
     else:
         func, job = process_scan, (args.output, opts, args.debug, args.rotate_faces)
-    if args.workers <= 1:
-        for f in files:
-            report(*func(f, *job))
-    else:
-        with ProcessPoolExecutor(max_workers=args.workers) as pool:
-            futures = [pool.submit(func, f, *job) for f in files]
-            for fut in as_completed(futures):
-                report(*fut.result())
+    run_batch(func, job, files, workers, report)
 
     if args.no_split:
         log.info("Gotowe: %d z %d plików w %.1fs (błędy: %d)", total, len(files),
