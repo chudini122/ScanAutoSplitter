@@ -121,8 +121,22 @@ GAP_MIN_PART_FRAC = 0.15         # każda część po cięciu musi mieć >= tyle
 GAP_MAX_CONTINUITY = 0.45        # max. korelacja treści po obu stronach cięcia; przy prawdziwej szczelinie
                                  # sąsiadują dwa różne zdjęcia (korelacja ~0), a jasny element zdjęcia
                                  # (np. biały filar budynku) ma po obu stronach tę samą strukturę
+# Szew: zdjęcia stykające się bez szczeliny (np. czarno-białe obok kolorowego). Prosta, ostra zmiana
+# obrazu wzdłuż prawie całej linii + dowód, że to granica dwóch odbitek (nie krawędź w treści zdjęcia).
+SEAM_SPLIT = True
+SEAM_STEP = 18.0                 # min. skok koloru (ΔE w Lab) w poprzek linii, by uznać punkt za krawędź
+SEAM_MAX_CONTINUITY = 0.65       # szew ma osobny dowód (niżej), więc korelacja treści może być wyższa niż przy przerwie
+SEAM_MIN_FRAC = 0.8              # krawędź musi biec przez >= tyle długości linii
+SEAM_BW_CHROMA = 6.0             # dowód 1: po jednej stronie zdjęcie czarno-białe (mediana chromy <= tyle)...
+SEAM_COLOR_CHROMA = 12.0         # ...a po drugiej kolorowe (mediana chromy >= tyle)
+SEAM_PAPER_FRAC = 0.7            # dowód 2: przy linii po jednej stronie biały brzeg odbitki (>= tyle),
+                                 #          po drugiej nie (<= 1 - tyle)
+SEAM_RIDGE_FRAC = 0.6            # dowód 3: wąska ciemna/jasna linia (cień, krawędź papieru) dokładnie na
+SEAM_RIDGE_STEP = 8.0            #          szwie, odróżniająca się od obu stron o >= tyle (L) na >= tyle długości
 GAP_PART_MAX_ASPECT = 3.2        # części po cięciu muszą wyglądać jak odbitki: proporcje boków <= tyle
 GAP_PART_MIN_SIDE_FRAC = 0.08    # ...i krótszy bok >= tyle dłuższego boku skanu (~24 mm na A4)
+GAP_MIN_LINE_FRAC = 0.3          # linia cięcia musi przecinać obszar na >= tyle jego maks. szerokości
+                                 # (obszary w kształcie L: krótka linia między węższym a szerszym zdjęciem)
 GAP_MAX_DEPTH = 6                # max. głębokość rekurencji (2^6 = 64 zdjęcia w jednym obszarze)
 
 # --- Doprecyzowanie i prostowanie --------------------------------------------
@@ -570,7 +584,7 @@ def gap_cut_candidates(gap_u: np.ndarray, mask_u: np.ndarray, long_side: float) 
             gd = cv2.dilate(g, np.ones(k, np.uint8)) & m
             den = m.sum(axis=1 - axis).astype(np.float32)
             num = gd.sum(axis=1 - axis).astype(np.float32)
-            ok = den >= 0.5 * den.max()
+            ok = den >= GAP_MIN_LINE_FRAC * den.max()
             idx = np.flatnonzero(ok)
             if len(idx) < 3 * off:
                 continue
@@ -624,9 +638,83 @@ def content_continuity(gray_u: np.ndarray, mask_u: np.ndarray, R: np.ndarray, ax
     return float(np.corrcoef(sa, sb)[0, 1])
 
 
+def seam_candidates(lab_u: np.ndarray, mask_u: np.ndarray, long_side: float) -> list:
+    """
+    Linie "szwu": prosta, ostra zmiana obrazu (skok ΔE >= SEAM_STEP) wzdłuż >= SEAM_MIN_FRAC
+    długości. Zwraca kandydatów w tym samym formacie co gap_cut_candidates.
+    """
+    h, w = mask_u.shape
+    b = max(1, int(round(GAP_BAND_FRAC * long_side)))
+    off = max(b + 2, int(round(GAP_SIDE_OFFSET_FRAC * long_side)))
+    d = 2  # skok liczony między pikselami odległymi o +-d od linii
+    found = []
+    for theta in np.arange(-GAP_MAX_ANGLE, GAP_MAX_ANGLE + 1e-6, GAP_ANGLE_STEP):
+        R = cv2.getRotationMatrix2D((w / 2, h / 2), float(theta), 1.0)
+        lab = cv2.warpAffine(lab_u, R, (w, h), flags=cv2.INTER_LINEAR)
+        m = cv2.warpAffine(mask_u, R, (w, h), flags=cv2.INTER_NEAREST)
+        for axis in (0, 1):
+            L, M = (lab, m) if axis == 0 else (lab.transpose(1, 0, 2), m.T)
+            step = np.sqrt(((L[2 * d:] - L[:-2 * d]) ** 2).sum(axis=2))       # wiersz y <-> y-d..y+d
+            valid = (M[2 * d:] > 0) & (M[:-2 * d] > 0)
+            edge = ((step >= SEAM_STEP) & valid).astype(np.uint8)
+            edge = cv2.dilate(edge, np.ones((2 * b + 1, 1), np.uint8)) & valid  # tolerancja +-b px
+            den = valid.sum(axis=1).astype(np.float32)
+            ok = den >= GAP_MIN_LINE_FRAC * max(den.max(), 1)
+            idx = np.flatnonzero(ok)
+            if len(idx) < 3 * off:
+                continue
+            lo, hi = idx[0], idx[-1]
+            frac = np.where(ok, edge.sum(axis=1) / np.maximum(den, 1), 0.0)
+            min_part = max(GAP_MIN_PART_FRAC * (hi - lo), off)
+            pos = np.arange(int(lo + min_part), int(hi - min_part) + 1)
+            if len(pos) == 0:
+                continue
+            for i in np.argsort(frac[pos])[::-1][:3]:
+                if frac[pos[i]] < SEAM_MIN_FRAC:
+                    break
+                found.append((float(frac[pos[i]]), R, axis, int(pos[i]) + d, off))
+    found.sort(key=lambda c: -c[0])
+    return found
+
+
+def seam_proof(lab_u: np.ndarray, gap_u: np.ndarray, mask_u: np.ndarray, R: np.ndarray, axis: int,
+               pos: int, off: int) -> str | None:
+    """Dowód, że szew to granica dwóch odbitek, a nie krawędź w treści jednego zdjęcia."""
+    h, w = mask_u.shape
+    lab = cv2.warpAffine(lab_u, R, (w, h), flags=cv2.INTER_LINEAR)
+    g = cv2.warpAffine(gap_u, R, (w, h), flags=cv2.INTER_NEAREST)
+    m = cv2.warpAffine(mask_u, R, (w, h), flags=cv2.INTER_NEAREST)
+    if axis:
+        lab, g, m = lab.transpose(1, 0, 2), g.T, m.T
+    n = lab.shape[0]
+    if pos - off - 2 < 0 or pos + off + 3 > n:
+        return None
+    cols = (m[pos - off:pos + off + 1].min(axis=0) > 0)
+    if cols.sum() < 20:
+        return None
+    A, B = lab[pos - off:pos - 2][:, cols], lab[pos + 3:pos + off + 1][:, cols]
+    chroma = lambda X: float(np.median(np.hypot(X[..., 1] - 128, X[..., 2] - 128)))
+    ca, cb = chroma(A), chroma(B)
+    if min(ca, cb) <= SEAM_BW_CHROMA and max(ca, cb) >= SEAM_COLOR_CHROMA:
+        return "czarno-białe / kolorowe (chroma %.0f / %.0f)" % (ca, cb)
+    near = max(2, off // 2)
+    pa = float(g[pos - near:pos - 1][:, cols].mean())
+    pb = float(g[pos + 2:pos + near + 1][:, cols].mean())
+    if max(pa, pb) >= SEAM_PAPER_FRAC and min(pa, pb) <= 1 - SEAM_PAPER_FRAC:
+        return "biały brzeg odbitki (%.2f / %.2f)" % (pa, pb)
+    Ll = lab[pos - 1:pos + 2, :, 0][:, cols].mean(axis=0)
+    La = lab[pos - 5:pos - 2, :, 0][:, cols].mean(axis=0)
+    Lb = lab[pos + 3:pos + 6, :, 0][:, cols].mean(axis=0)
+    da, db = Ll - La, Ll - Lb
+    ridge = ((np.abs(da) >= SEAM_RIDGE_STEP) & (np.abs(db) >= SEAM_RIDGE_STEP) & (np.sign(da) == np.sign(db)))
+    if ridge.mean() >= SEAM_RIDGE_FRAC:
+        return "linia krawędzi papieru (%.2f)" % ridge.mean()
+    return None
+
+
 def gap_cut_regions(region: np.ndarray, gap: np.ndarray, gray: np.ndarray, img_area: float,
-                    img_long: float, depth: int = 0) -> list:
-    """Rekurencyjnie tnie obszar (maskę w układzie roboczym) wzdłuż przerw. Zwraca prostokąty."""
+                    img_long: float, depth: int = 0, lab: np.ndarray | None = None) -> list:
+    """Rekurencyjnie tnie obszar (maskę w układzie roboczym) wzdłuż przerw i szwów. Zwraca prostokąty."""
     pts = cv2.findNonZero(region)
     if pts is None:
         return []
@@ -637,37 +725,48 @@ def gap_cut_regions(region: np.ndarray, gap: np.ndarray, gray: np.ndarray, img_a
     gap_u = cv2.warpAffine(gap, A, (w, h), flags=cv2.INTER_NEAREST)
     mask_u = cv2.warpAffine(region, A, (w, h), flags=cv2.INTER_NEAREST) // 255
     gray_u = cv2.warpAffine(gray, A, (w, h), flags=cv2.INTER_LINEAR).astype(np.float32)
-    cut = None
-    for _, R, axis, pos, off in gap_cut_candidates(gap_u, mask_u, img_long)[:8]:
-        corr = content_continuity(gray_u, mask_u, R, axis, pos, off)
-        if corr <= GAP_MAX_CONTINUITY:
-            cut = (R, axis, pos)
-            break
-        log.debug("Odrzucono linię cięcia: treść ciągnie się przez nią (korelacja %.2f)", corr)
-    if cut is None:
-        return [rect]
-    R, axis, pos = cut
-    # Strona linii dla każdego piksela obszaru: obraz -> układ wyprostowany -> obrócony o theta.
+    cands = [("przerwa", c) for c in gap_cut_candidates(gap_u, mask_u, img_long)[:8]]
+    lab_u = None
+    if SEAM_SPLIT and lab is not None:
+        lab_u = cv2.GaussianBlur(cv2.warpAffine(lab, A, (w, h), flags=cv2.INTER_LINEAR).astype(np.float32), (3, 3), 0)
+        cands += [("szew", c) for c in seam_candidates(lab_u, mask_u, img_long)[:8]]
     p = pts.reshape(-1, 2).astype(np.float32)
     q = p @ A[:, :2].T + A[:, 2]
-    t = q @ R[1 - axis, :2] + R[1 - axis, 2]  # oś 0 = wiersze -> współrzędna y po obrocie
-    parts = []
-    for sel in (t < pos, t >= pos):
-        sub = np.zeros_like(region)
-        sp = p[sel].astype(np.int32)
-        sub[sp[:, 1], sp[:, 0]] = 255
-        sub = morph(sub, cv2.MORPH_OPEN, 3)  # odcina resztki szczeliny przy linii cięcia
-        r = fit_rect(cv2.findNonZero(sub)) if cv2.countNonZero(sub) else None
-        if r is None or not rect_ok(r, img_area, img_long) or \
-                min(r[1]) < GAP_PART_MIN_SIDE_FRAC * img_long or \
-                max(r[1]) / max(min(r[1]), 1e-6) > GAP_PART_MAX_ASPECT:
-            return [rect]  # cięcie dałoby kawałek niepodobny do odbitki — rezygnujemy
-        parts.append(sub)
-    log.debug("Cięcie wzdłuż przerwy (głębokość %d, oś %d)", depth, axis)
-    return [r for sub in parts for r in gap_cut_regions(sub, gap, gray, img_area, img_long, depth + 1)]
+    for kind, (_, R, axis, pos, off) in cands:
+        corr = content_continuity(gray_u, mask_u, R, axis, pos, off)
+        if corr > (SEAM_MAX_CONTINUITY if kind == "szew" else GAP_MAX_CONTINUITY):
+            log.debug("Odrzucono %s: treść ciągnie się przez linię (korelacja %.2f)", kind, corr)
+            continue
+        proof = ""
+        if kind == "szew":
+            proof = seam_proof(lab_u, gap_u, mask_u, R, axis, pos, off)
+            if proof is None:
+                continue  # zwykła krawędź w treści zdjęcia (horyzont, framuga...)
+        # Strona linii dla każdego piksela obszaru: obraz -> układ wyprostowany -> obrócony o theta.
+        t = q @ R[1 - axis, :2] + R[1 - axis, 2]  # oś 0 = wiersze -> współrzędna y po obrocie
+        parts = []
+        for sel in (t < pos, t >= pos):
+            sub = np.zeros_like(region)
+            sp = p[sel].astype(np.int32)
+            sub[sp[:, 1], sp[:, 0]] = 255
+            sub = morph(sub, cv2.MORPH_OPEN, 3)  # odcina resztki szczeliny przy linii cięcia
+            r = fit_rect(cv2.findNonZero(sub)) if cv2.countNonZero(sub) else None
+            if r is None or not rect_ok(r, img_area, img_long) or \
+                    min(r[1]) < GAP_PART_MIN_SIDE_FRAC * img_long or \
+                    max(r[1]) / max(min(r[1]), 1e-6) > GAP_PART_MAX_ASPECT:
+                parts = None  # kawałek niepodobny do odbitki — spróbuj następnej linii
+                break
+            parts.append(sub)
+        if parts is None:
+            continue
+        log.debug("Cięcie: %s%s (głębokość %d, oś %d)", kind, f" — {proof}" if proof else "", depth, axis)
+        return [r for sub in parts
+                for r in gap_cut_regions(sub, gap, gray, img_area, img_long, depth + 1, lab)]
+    return [rect]
 
 
-def find_candidates(mask: np.ndarray, gap: np.ndarray | None = None, gray: np.ndarray | None = None) -> list:
+def find_candidates(mask: np.ndarray, gap: np.ndarray | None = None, gray: np.ndarray | None = None,
+                    lab: np.ndarray | None = None) -> list:
     """Zwraca listę obróconych prostokątów (w układzie kopii roboczej)."""
     h, w = mask.shape
     img_area, img_long = float(h * w), float(max(h, w))
@@ -677,6 +776,15 @@ def find_candidates(mask: np.ndarray, gap: np.ndarray | None = None, gray: np.nd
         r = fit_rect(c)
         if r[1][0] * r[1][1] < MIN_AREA_FRAC * img_area:
             continue  # kurz / śmieci
+        # Najpierw precyzyjne cięcia wzdłuż szczelin i szwów (granica dokładnie na krawędzi odbitki);
+        # dopiero gdy ich brak — rozdzielanie po przewężeniu (watershed), mniej dokładne co do granicy.
+        if GAP_SPLIT and gap is not None:
+            region = np.zeros_like(mask)
+            cv2.drawContours(region, [c], -1, 255, cv2.FILLED)
+            cut = gap_cut_regions(region, gap, gray, img_area, img_long, lab=lab)
+            if len(cut) > 1:
+                rects.extend(x for x in cut if rect_ok(x, img_area, img_long))
+                continue
         # Zawsze sprawdzamy, czy obszar to kilka sklejonych zdjęć — także gdy jest "za duży"
         # (np. zdjęcia wypełniające prawie cały skan, rozdzielone wąskimi przerwami).
         parts = split_touching(c, img_area, img_long)
@@ -688,7 +796,7 @@ def find_candidates(mask: np.ndarray, gap: np.ndarray | None = None, gray: np.nd
             if GAP_SPLIT and gap is not None:
                 region = np.zeros_like(mask)
                 cv2.drawContours(region, [pc], -1, 255, cv2.FILLED)
-                rects.extend(x for x in gap_cut_regions(region, gap, gray, img_area, img_long)
+                rects.extend(x for x in gap_cut_regions(region, gap, gray, img_area, img_long, lab=lab)
                              if rect_ok(x, img_area, img_long))
             elif rect_ok(pr, img_area, img_long):
                 rects.append(pr)
@@ -1014,7 +1122,8 @@ def detect(img: np.ndarray):
     w2m = s_mid / scale  # robocza -> mid
     edges_mid = tuple(int(np.ceil(e * w2m)) for e in edges)
     gray = cv2.cvtColor(work, cv2.COLOR_BGR2GRAY)
-    coarse = [scale_rect(r, w2m) for r in find_candidates(mask, gap, gray)]
+    lab = cv2.cvtColor(work, cv2.COLOR_BGR2LAB)
+    coarse = [scale_rect(r, w2m) for r in find_candidates(mask, gap, gray, lab)]
     dets = []
     for k, rect in enumerate(coarse):
         if REFINE_FULL_RES and w2m > 1.0:

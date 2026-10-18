@@ -299,6 +299,7 @@ Wszystkie parametry są stałymi na początku pliku `scan_autosplitter.py` (sekc
 | Ucina białą ramkę odbitek | zmniejsz `GROW_DELTA` (np. 2.0) |
 | Do zdjęcia doklejony pas tła | zwiększ `GROW_DELTA` (np. 5.0) lub ustaw `GROW_TO_PAPER_EDGE = False` |
 | Dwa blisko leżące zdjęcia wycięte jako jedno | zmniejsz `GAP_MIN_FRAC` (np. 0.45) lub `CLOSE_KERNEL_FRAC` (np. 0.002) |
+| Stykające się zdjęcia (bez szczeliny) nie rozdzielone | zmniejsz `SEAM_MIN_FRAC` (np. 0.7) lub `SEAM_STEP` (np. 14) |
 | Jedno zdjęcie rozcięte na części (np. wzdłuż jasnego słupa, horyzontu) | zwiększ `GAP_MIN_FRAC` (np. 0.7) lub zmniejsz `GAP_MAX_CONTINUITY` (np. 0.3); `GAP_SPLIT = False` wyłącza cięcie wzdłuż przerw |
 | Zdjęcie bez twarzy obrócone niepotrzebnie | zwiększ `FACE_MIN_CONFIDENCE` (np. 0.9) lub użyj `--no-face-rotate` |
 | Zdjęcie z twarzami nie zostało obrócone | zmniejsz `FACE_MIN_CONFIDENCE` (np. 0.7) |
@@ -378,6 +379,11 @@ Zaawansowane ustawienia systemu → Zmienne środowiskowe) lub przesunąć wła�
    prawie na całej długości są tłem skanera, a tuż obok — zdjęciem. Cięcie jest przyjmowane,
    gdy obie części wyglądają jak odbitki (proporcje, rozmiar), a treść nie „przechodzi”
    przez linię (niska korelacja obu stron — chroni np. białe słupy budynków).
+   Zdjęcia stykające się bez szczeliny są dzielone wzdłuż „szwu”: prostej, ostrej zmiany obrazu
+   na >= 80% długości linii, ale tylko z dowodem, że to granica dwóch odbitek — po jednej stronie
+   czarno-białe, po drugiej kolorowe; biały brzeg odbitki po jednej stronie; albo cienka linia
+   krawędzi papieru/cienia dokładnie na szwie. Zwykłe krawędzie w treści (horyzont, framuga)
+   nie spełniają tych warunków i nie są cięte.
 3. Doprecyzowanie każdej ramki na pełnej rozdzielczości i dołączenie białej ramki odbitki
    (uśrednione profile linii wzdłuż każdego boku).
 4. Prostowanie (transformacja perspektywiczna, interpolacja Lanczos). Zdjęcia leżące prosto
