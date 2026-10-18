@@ -263,8 +263,8 @@ python scan_autosplitter.py "D:\skany" "D:\skany\zdjecia" --format webp --qualit
 - `<skan>_debug_twarze.jpg` — każdy zapisany wycinek (już po obrocie), zielone ramki to
   wykryte twarze z pewnością (0–1). Pod spodem decyzja i najwyższa pewność twarzy w każdej
   z 4 orientacji: `0` (bez obrotu), `L90` (90° w lewo), `180`, `P90` (90° w prawo).
-  Zdjęcie jest obracane, gdy najlepsza orientacja ma twarz o pewności ≥ 0.8
-  i wyraźnie (o 0.1) wyższej niż bez obrotu.
+  Wartości to średnia pewność z kilku skal i z odbicia lustrzanego. Zdjęcie jest obracane,
+  gdy najlepsza orientacja ma średnią ≥ 0.7 i wyższą niż bez obrotu (o ≥ 0.05).
 
 ### Duże skany (1200 dpi) i pamięć RAM
 
@@ -301,8 +301,8 @@ Wszystkie parametry są stałymi na początku pliku `scan_autosplitter.py` (sekc
 | Dwa blisko leżące zdjęcia wycięte jako jedno | zmniejsz `GAP_MIN_FRAC` (np. 0.45) lub `CLOSE_KERNEL_FRAC` (np. 0.002) |
 | Stykające się zdjęcia (bez szczeliny) nie rozdzielone | zmniejsz `SEAM_MIN_FRAC` (np. 0.7) lub `SEAM_STEP` (np. 14) |
 | Jedno zdjęcie rozcięte na części (np. wzdłuż jasnego słupa, horyzontu) | zwiększ `GAP_MIN_FRAC` (np. 0.7) lub zmniejsz `GAP_MAX_CONTINUITY` (np. 0.3); `GAP_SPLIT = False` wyłącza cięcie wzdłuż przerw |
-| Zdjęcie bez twarzy obrócone niepotrzebnie | zwiększ `FACE_MIN_CONFIDENCE` (np. 0.9) lub użyj `--no-face-rotate` |
-| Zdjęcie z twarzami nie zostało obrócone | zmniejsz `FACE_MIN_CONFIDENCE` (np. 0.7) |
+| Zdjęcie obrócone niepotrzebnie | zwiększ `FACE_MIN_CONFIDENCE` (np. 0.8) i/lub `FACE_ROTATION_MARGIN` (np. 0.1), albo `--no-face-rotate` |
+| Zdjęcie z twarzami nie zostało obrócone | zmniejsz `FACE_MIN_CONFIDENCE` (np. 0.6) lub `FACE_ROTATION_MARGIN` (np. 0.02) |
 
 **Wskazówka przy skanowaniu:** zdjęcia rozdzielane są nawet przy szczelinie ok. 0.3 mm, także
 gdy szczelina jest krzywa i w jednym rogu zdjęcia się stykają. Zdjęcia stykające się na całej
@@ -388,7 +388,8 @@ Zaawansowane ustawienia systemu → Zmienne środowiskowe) lub przesunąć wła�
    (uśrednione profile linii wzdłuż każdego boku).
 4. Prostowanie (transformacja perspektywiczna, interpolacja Lanczos). Zdjęcia leżące prosto
    (kąt < 0.05°) są tylko wycinane — piksele identyczne z oryginałem.
-5. Orientacja wg twarzy: detektor YuNet sprawdza 4 obroty; zdjęcie jest obracane, gdy
-   w innej orientacji twarz jest wykrywana wyraźnie pewniej (punkty oczu/nosa/ust muszą
-   układać się pionowo).
+5. Orientacja wg twarzy: detektor YuNet sprawdza 4 obroty w kilku skalach i w odbiciu
+   lustrzanym; zdjęcie jest obracane do orientacji, w której twarz jest wykrywana konsekwentnie
+   najpewniej (twarze leżące bokiem detektor też czasem „widzi”, ale niestabilnie — uśrednianie
+   to wychwytuje).
 6. Zapis: domyślnie bezstratny PNG; opcjonalnie TIFF, TIFF-LZW, JPG lub WebP (z limitem rozmiaru).

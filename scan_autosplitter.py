@@ -168,8 +168,10 @@ FACE_DETECT_SIDES = (640, 1024, 1600)  # rozmiary (dłuższy bok) do szukania tw
                                  # tylko gdy na mniejszym brak pewnej twarzy (małe twarze, zdjęcia grupowe)
 FACE_SCORE_THRESHOLD = 0.6       # min. pewność pojedynczej twarzy branej pod uwagę
 FACE_ENHANCE = True              # wyrównanie kontrastu (CLAHE) przed detekcją — ciemne, stare odbitki
-FACE_MIN_CONFIDENCE = 0.8        # obracamy tylko, gdy w nowej orientacji jest twarz o takiej pewności
-FACE_ROTATION_MARGIN = 0.1       # ...i jest ona pewniejsza niż najlepsza twarz w obecnej orientacji o tyle
+FACE_MIN_CONFIDENCE = 0.7        # obracamy tylko, gdy w nowej orientacji średnia pewność twarzy >= tyle
+FACE_ROTATION_MARGIN = 0.05      # ...i jest wyższa niż w obecnej orientacji o tyle
+FACE_CLEAR_CONFIDENCE = 0.85     # przy oczywistej twarzy (>= tyle i przewaga >= FACE_CLEAR_LEAD nad każdą
+FACE_CLEAR_LEAD = 0.3            # inną orientacją) kończymy już na pierwszej skali — szybciej
 
 # --- Kolejność wyników -------------------------------------------------------
 ROW_GROUPING_FRAC = 0.5          # zdjęcia, których środki różnią się w pionie o < tyle*wysokość, są w jednym rzędzie
@@ -1030,16 +1032,15 @@ ROTATION_NAMES = {0: "bez obrotu", 1: "90 w lewo", 2: "180", 3: "90 w prawo"}  #
 
 
 def face_score(det, img8: np.ndarray):
-    """(suma pewności, najwyższa pewność, twarze [x,y,w,h,pewność]) dla twarzy stojących pionowo."""
+    """(suma pewności, najwyższa pewność, twarze [x,y,w,h,pewność]) w danym obrazie.
+    Uwaga: punkty oczu/nosa/ust YuNet zawsze wyglądają "pionowo" (także dla twarzy leżącej bokiem),
+    więc nie nadają się do odróżniania orientacji — decyduje pewność wykrycia."""
     det.setInputSize((img8.shape[1], img8.shape[0]))
     _, faces = det.detect(img8)
     total = best = 0.0
     found = []
     for f in faces if faces is not None else []:
         # YuNet: [x,y,w,h, oko P, oko L, nos, usta P, usta L (x,y), pewność]
-        eyes_y, nose_y, mouth_y = (f[5] + f[7]) / 2, f[9], (f[11] + f[13]) / 2
-        if not eyes_y < nose_y < mouth_y:
-            continue  # układ punktów nie pasuje do pionowej twarzy
         total += float(f[14])
         best = max(best, float(f[14]))
         found.append([float(v) for v in f[:4]] + [float(f[14])])
@@ -1057,7 +1058,11 @@ def face_orientation(crop: np.ndarray) -> tuple[int, dict]:
     """
     Liczba obrotów o 90° (przeciwnie do wskazówek zegara, jak np.rot90), po których twarze
     stoją pionowo; 0 = bez zmian (także gdy na zdjęciu nie ma pewnie wykrytych twarzy).
-    Drugi element to opis decyzji (do podglądu --debug).
+
+    Detektor bywa "przekonany" także o twarzy leżącej bokiem, ale takie trafienia są niestabilne.
+    Dlatego pewność dla każdej z 4 orientacji uśredniamy po kilku skalach i po odbiciu lustrzanym
+    (odbicie nie zmienia orientacji, tylko zamienia "90 w lewo" z "90 w prawo"). Prawdziwa
+    orientacja wygrywa konsekwentnie. Drugi element wyniku to opis decyzji (do --debug).
     """
     info = {"scores": [0.0] * 4, "side": None, "faces": [], "reason": "brak twarzy"}
     det = get_face_detector()
@@ -1065,32 +1070,41 @@ def face_orientation(crop: np.ndarray) -> tuple[int, dict]:
         info["reason"] = "detektor niedostepny"
         return 0, info
     img8 = to_bgr8(crop)
-    for side in FACE_DETECT_SIDES:
-        f = min(1.0, side / max(img8.shape[:2]))
-        small = cv2.resize(img8, None, fx=f, fy=f, interpolation=cv2.INTER_AREA) if f < 1 else img8
+    acc, n, shown = np.zeros(4), 0, None
+    for i, side in enumerate(FACE_DETECT_SIDES):
+        f = side / max(img8.shape[:2])
+        if f > 1.0 and i > 0:
+            break  # zdjęcie mniejsze niż ta skala — kolejne powiększanie nic nie wnosi
+        small = cv2.resize(img8, None, fx=f, fy=f, interpolation=cv2.INTER_AREA if f < 1 else cv2.INTER_CUBIC)
         if FACE_ENHANCE:
             small = enhance_for_faces(small)
-        res = [face_score(det, np.ascontiguousarray(np.rot90(small, k))) for k in range(4)]
-        # Decyduje najpewniejsza pojedyncza twarz (suma tylko rozstrzyga remisy) — fałszywe
-        # trafienia w złej orientacji mają zwykle niską pewność, ale bywa ich kilka.
-        k = max(range(4), key=lambda i: (res[i][1], res[i][0]))
-        best = res[k][1]
-        info["scores"] = [r[1] for r in res]
-        info["side"] = side
-        if best < FACE_MIN_CONFIDENCE:
-            if f >= 1:
-                break  # zdjęcie i tak mniejsze — większa skala nic nie da
-            continue  # brak pewnej twarzy — spróbuj w większej rozdzielczości
-        if k and best < res[0][1] + FACE_ROTATION_MARGIN:
-            info["reason"] = "za mala przewaga nad obecna orientacja"
-            k = 0
-        else:
-            info["reason"] = "twarz %.2f" % best
-        # Twarze we współrzędnych względnych (0..1) obrazu po obrocie o k.
-        rh, rw = np.rot90(small, k).shape[:2]
-        info["faces"] = [[x / rw, y / rh, w / rw, h / rh, sc] for x, y, w, h, sc in res[k][2]]
-        return k, info
-    return 0, info
+        for flip in (False, True):
+            src = np.ascontiguousarray(small[:, ::-1]) if flip else small
+            res = [face_score(det, np.ascontiguousarray(np.rot90(src, k))) for k in range(4)]
+            sc = [r[1] for r in res]
+            acc += [sc[0], sc[3], sc[2], sc[1]] if flip else sc  # odbicie zamienia L90 <-> P90
+            n += 1
+            if not flip:
+                shown = (small, res)
+        mean = acc / n
+        k = int(np.argmax(mean))
+        others = np.delete(mean, k)
+        info["scores"], info["side"] = [float(v) for v in mean], side
+        if i == 0 and mean[k] >= FACE_CLEAR_CONFIDENCE and mean[k] - others.max() >= FACE_CLEAR_LEAD:
+            break  # oczywisty przypadek — bez kolejnych skal
+    mean = acc / max(n, 1)
+    k = int(np.argmax(mean))
+    if mean[k] < FACE_MIN_CONFIDENCE:
+        return 0, info
+    if k and mean[k] - mean[0] < FACE_ROTATION_MARGIN:
+        info["reason"] = "za mala przewaga nad obecna orientacja"
+        k = 0
+    else:
+        info["reason"] = "twarz %.2f" % mean[k]
+    small, res = shown
+    rh, rw = np.rot90(small, k).shape[:2]  # twarze we współrzędnych względnych obrazu po obrocie
+    info["faces"] = [[x / rw, y / rh, w / rw, h / rh, sc] for x, y, w, h, sc in res[k][2]]
+    return k, info
 
 
 # -----------------------------------------------------------------------------
